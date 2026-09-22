@@ -109,8 +109,10 @@ struct server_lru_sched {
             SRV_INF("request for name=%s joined the queue, %d waiting\n", model_id.c_str(), e->n_waiters);
             return;
         }
+        // every load now goes through the queue (#29217), so this is not only
+        // about models_max being reached - keep the message generic
         queue.push_back({ model_id, 1, false, false });
-        SRV_INF("models_max reached, request for name=%s queued at position %zu\n",
+        SRV_INF("request for name=%s queued at position %zu\n",
                 model_id.c_str(), queue.size());
     }
 
@@ -1125,8 +1127,11 @@ void server_models::load(const std::string & name, const load_options & opts) {
 
         child_proc->stopped.store(true, std::memory_order_release);
         {
+            // do not erase stopping_models here: the erase must happen under the
+            // same lock as the UNLOADED transition (in update_status), so no
+            // request can observe a dead child that is neither stopping nor
+            // unloaded (#29217)
             std::lock_guard<std::mutex> lk(this->mutex);
-            stopping_models.erase(name);
             cv_stop.notify_all();
         }
         if (stopping_thread.joinable()) {
@@ -1138,7 +1143,11 @@ void server_models::load(const std::string & name, const load_options & opts) {
 
         // update status and exit code
         if (child_mode == SERVER_CHILD_MODE_DOWNLOAD) {
-            // instance will be cleaned up on next load_models() call
+            // no update_status() here, so clear the stopping mark ourselves or it
+            // can outlive the child and block future instances of the same name (#29217)
+            std::lock_guard<std::mutex> lk(this->mutex);
+            stopping_models.erase(name);
+            cv.notify_all();
         } else {
             this->update_status(name, {
                 SERVER_MODEL_STATUS_UNLOADED,
@@ -1228,6 +1237,9 @@ void server_models::update_status(const std::string & name, const update_status_
         auto & meta = it->second.meta;
         meta.status      = args.status;
         meta.exit_code   = args.exit_code;
+        if (args.status == SERVER_MODEL_STATUS_UNLOADED) {
+            stopping_models.erase(name);
+        }
         if (!args.loaded_info.is_null()) {
             meta.loaded_info = args.loaded_info;
         }
@@ -1371,10 +1383,15 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
     if (!meta.has_value()) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
-    if (meta->is_ready()) {
+    bool stopping;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        stopping = stopping_models.count(name) > 0;
+    }
+    if (!stopping && meta->is_ready()) {
         return false; // ready for taking requests
     }
-    if (meta->status == SERVER_MODEL_STATUS_SLEEPING) {
+    if (!stopping && meta->status == SERVER_MODEL_STATUS_SLEEPING) {
         return false; // child is sleeping but still running; new request will wake it up
     }
 
@@ -1385,22 +1402,16 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
         std::unique_lock<std::mutex> lk(mutex);
         auto it = mapping.find(name);
         if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_UNLOADED) {
-            bool has_capacity = sched->has_capacity(lk);
-            if (has_capacity && sched->queue_empty(lk)) {
-                lk.unlock();
-                SRV_INF("model name=%s is not loaded, loading...\n", name.c_str());
-                load(name);
-                did_load = true;
-            } else {
-                // also queue when a slot looks free but others wait already, else they starve
-                sched->join(lk, name);
-                queued = true;
-                if (!has_capacity) {
-                    // an idle model may sit here right now, do not wait for a request to end
-                    victim = sched->pick_victim(lk, name);
-                    if (!victim.empty()) {
-                        sched->mark_slot_pending(lk, name);
-                    }
+            // route every load through the queue (#29217): the queue entry protects
+            // the model from eviction until its waiters leave. the load itself is
+            // done by the head waiter via try_claim below.
+            sched->join(lk, name);
+            queued = true;
+            if (!sched->has_capacity(lk)) {
+                // an idle model may sit here right now, do not wait for a request to end
+                victim = sched->pick_victim(lk, name);
+                if (!victim.empty()) {
+                    sched->mark_slot_pending(lk, name);
                 }
             }
         }
@@ -1426,6 +1437,18 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
             auto it = mapping.find(name);
             if (it == mapping.end()) {
                 break; // removed by another code path, nothing to wait for
+            }
+            if (stopping_models.count(name)) {
+                // a stopping instance takes no new request, the next instance serves it (#29217)
+                if (!queued) {
+                    sched->join(lk, name);
+                    queued = true;
+                }
+                if (should_stop && should_stop()) {
+                    throw std::runtime_error("request cancelled while waiting for model name=" + name);
+                }
+                cv.wait_for(lk, std::chrono::milliseconds(200));
+                continue;
             }
             const server_model_status status = it->second.meta.status;
 
