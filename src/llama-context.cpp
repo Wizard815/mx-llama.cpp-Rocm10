@@ -590,6 +590,18 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
+            // A fused node that the scheduler placed on a sibling device of the same kind, one that supports the op, is not a
+            // missing-support fallback. It happens when every input of the node was produced on the previous layer's device,
+            // as with the DeepSeek-V4.1 carried hyper-connection mix under -sm layer. The unfused chain would sit there too.
+            const bool sibling_ok = device_fused != nullptr && device_layer != nullptr && device_fused != device_layer &&
+                ggml_backend_dev_type(device_fused) == ggml_backend_dev_type(device_layer) &&
+                ggml_backend_dev_supports_op(device_fused, node.tensor);
+            if (sibling_ok) {
+                LLAMA_LOG_INFO("%s: layer %d is assigned to device %s and %s runs on sibling device %s, accepted\n",
+                        func, node.il, ggml_backend_dev_name(device_layer), probe.name, ggml_backend_dev_name(device_fused));
+                continue;
+            }
+
             if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
                         "is assigned to device %s (usually due to missing support)\n",

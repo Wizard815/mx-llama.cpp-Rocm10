@@ -622,6 +622,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     }
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // A tied output head is loaded as a duplicate of token_embd.weight and keeps that name.
+        // By name it would fall to the mirrored default with the embedding table, and every lane would then run the whole head each token.
+        // The duplicate is only ever read by MUL_MAT, so it takes the output.weight rules below.
+        const bool tied_output = tensor != nullptr && tensor == ud->model->output && ud->model->output != ud->model->tok_embd &&
+            !std::regex_match(tensor_name, pattern_output_weight);
+
         // The MTP draft block sits one block past the trunk and is loaded as its own
         // model on a single device, yet it inherits the target's split mode and so
         // still passes through here. Mirror it whole. Two reasons: its tensor set is
@@ -751,7 +757,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_weight)   || std::regex_match(tensor_name, pattern_ffn_down_bias)   ||
                 std::regex_match(tensor_name, pattern_ffn_down_exps_bias);
-            const bool is_output =
+            const bool is_output = tied_output ||
                 std::regex_match(tensor_name, pattern_output_weight) || std::regex_match(tensor_name, pattern_output_bias);
             if (!is_ffn && !is_output) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -851,7 +857,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // output
-        if (std::regex_match(tensor_name, pattern_output_weight)) {
+        if (tied_output || std::regex_match(tensor_name, pattern_output_weight)) {
             // deepseek4 keeps the vocabulary-parallel head: mirroring it, as upstream does,
             // measured 3.8 percent slower at -tps 4 on 8 MI50 and reads the whole head on
             // every device each token.

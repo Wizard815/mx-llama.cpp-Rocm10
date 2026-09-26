@@ -806,7 +806,19 @@ bool tp_custom_ar_prepare(CustomARContext * ctx,
     const bool auto_small_twoshot =
         nranks == 5 || nranks == 8 || nranks == 10 ||
         (nranks == 4 && ctx->prefer_small_twoshot);
-    const int64_t twoshot_min_ne = auto_small_twoshot ? 1 : twoshot_legacy_min_ne;
+    // A standalone four-rank group was pinned to broadcast at every size it can reach, because the legacy crossover sits at the size where the group stops using the custom path at all.
+    // Broadcast wins while a message is one token wide, and loses once it is several, which is what a speculative verify batch sends: at four ranks its outbound grows with the group while twoshot's does not.
+    // Two ranks stay on broadcast whatever the size, since twoshot moves the same bytes there and adds a second phase.
+    // GGML_TP_AR_TWOSHOT_MIN_NE overrides the crossover in elements for tuning.
+    const int64_t twoshot_small_min_ne = nranks >= 4 ? 8192 : twoshot_legacy_min_ne;
+    static const int64_t s_twoshot_min_ne_env = []{
+        const char * e = getenv("GGML_TP_AR_TWOSHOT_MIN_NE");
+        return e != nullptr ? (int64_t) strtoll(e, nullptr, 10) : (int64_t) -1;
+    }();
+    int64_t twoshot_min_ne = auto_small_twoshot ? 1 : twoshot_small_min_ne;
+    if (s_twoshot_min_ne_env >= 0) {
+        twoshot_min_ne = s_twoshot_min_ne_env;
+    }
     const bool s_twoshot =
         twoshot_eligible &&
         (s_twoshot_env == 1 || (s_twoshot_env == -1 && n_elements >= twoshot_min_ne));

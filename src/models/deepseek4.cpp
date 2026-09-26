@@ -364,7 +364,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         ggml_tensor ** comb,
         int il,
         ggml_tensor ** pre_out,
-        ggml_tensor  * mix_in) const {
+        ggml_tensor  * mix_in,
+        bool           collapse) const {
     const int64_t hc         = hparams.dsv4_hc_mult;
     const int64_t hc_dim     = hc*n_embd;
     const int64_t hc_mix_dim = (2 + hc)*hc;
@@ -417,6 +418,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
 
     // V4 collapses with the mix this sublayer just computed.
     // V4.1 hands its coefficients to the NEXT sublayer instead - attention uses the previous block's ffn mix, the FFN uses this block's attention mix - so the caller passes the carried one.
+    // A caller that replaces the collapse with its own selection (V4.1 layer 0, which has no carried mix yet) must not get a mix built here.
+    // A built but unused mix registers a fused node that no backend is ever assigned.
+    // The fusion probe then reads that as missing support and disables the fused hc_pre for every layer.
+    if (!collapse) {
+        return nullptr;
+    }
     ggml_tensor * result = build_hc_pre(x, mix_in ? mix_in : pre, il);
     return result;
 }
@@ -1343,7 +1350,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 model.layers[il].hc_attn_fn,
                 model.layers[il].hc_attn_scale,
                 model.layers[il].hc_attn_base,
-                &post, &comb, il, &attn_pre, hc_shift ? carry_pre : nullptr);
+                &post, &comb, il, &attn_pre, hc_shift ? carry_pre : nullptr,
+                /*collapse =*/ !(hc_shift && carry_pre == nullptr));
         if (hc_shift && carry_pre == nullptr) {
             // the initial one-hot mix selects copy 0
             cur = ggml_cont_2d(ctx0, ggml_view_2d(ctx0, inpL, n_embd, inpL->ne[2], inpL->nb[2], 0),

@@ -1198,7 +1198,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor ** comb,
                 int il,
                 ggml_tensor ** pre_out = nullptr,
-                ggml_tensor  * mix_in  = nullptr) const;
+                ggml_tensor  * mix_in  = nullptr,
+                bool           collapse = true) const;
 
         // V4 folds the hyper-connection copies with its own output_hc_* head tensors.
         // V4.1 ships none and reuses the mix the last layer already computed.
