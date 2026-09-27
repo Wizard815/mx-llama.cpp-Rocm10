@@ -1,0 +1,24 @@
+FROM mx-llama-rocm10-gfx906:local 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-server python3 python3-pip tmux ca-certificates \
+    && mkdir -p /run/sshd \
+    && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+    && sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+    && echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf \
+    && echo "/app" > /etc/ld.so.conf.d/llama-app.conf \
+    && ldconfig \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN echo "PATH=/opt/rocm/bin:/app:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" > /etc/environment \
+    && echo "ROCM_PATH=/opt/rocm" >> /etc/environment \
+    && echo "HIP_PATH=/opt/rocm" >> /etc/environment \
+    && echo "HF_HOME=/app/models/HFCache" >> /etc/environment \
+    && echo "HUGGINGFACE_HUB_CACHE=/app/models/HFCache/hub" >> /etc/environment \
+    && echo "HF_HUB_CACHE=/app/models/HFCache/hub" >> /etc/environment
+ENV PATH="/app:/opt/rocm/bin:$PATH"
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 22
+ENTRYPOINT ["/entrypoint.sh"]

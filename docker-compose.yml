@@ -1,0 +1,46 @@
+name: mx-llamacpp          # pins the image namespace: mx-llamacpp-<service>
+
+services:
+  # Build-only: produces the llama.cpp image the ssh container is built FROM.
+  # Behind a profile so a plain `up -d` never tries to run it.
+  gfx906-base:
+    profiles: ["build"]
+    build:
+      context: /mnt/user/appdata/mx-llama.cpp-Rocm10
+      dockerfile: gfx906-rocm10.Dockerfile
+    image: mx-llama-rocm10-gfx906:local
+
+  mx-llamacpp-ssh:
+    build:
+      context: .
+      dockerfile: Dockerfile.mx-llamacpp-ssh
+    image: mx-llamacpp-mx-llamacpp-ssh:latest      #
+    container_name: mx-llamacpp-ssh
+    restart: unless-stopped
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - "18"
+    volumes:
+      - /mnt/user/appdata/odysseus/data/ssh/id_ed25519.pub:/run/secrets/authorized_key:ro
+      - /mnt/user/OnePiece/HomeLab/LLMBin:/app/models
+    ports:
+      - "2222:22"
+      - "8000:8000"
+      - "8001:8001"
+      - "8002:8002"
+
+    environment:
+     - HUGGINGFACE_HUB_CACHE=/app/models/HFCache/hub
+    networks:
+#      - default
+      - ai_net
+
+networks:
+#  default:
+#    name: odysseus_default
+#    external: true
+  ai_net:
+    external: true
