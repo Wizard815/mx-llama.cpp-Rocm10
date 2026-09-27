@@ -1,0 +1,195 @@
+# Builds llama.cpp from THIS repo for gfx906, replacing the prebuilt
+# zenth815/mx-llama-rocm10-gfx906:latest from Docker Hub.
+#
+# Stage 1 of the chain. Stage 2 is your existing Dockerfile.mx-llamacpp-ssh,
+# which now does `FROM mx-llama-rocm10-gfx906:local`. Stage 3 is llama-swap's
+# docker/llama-swap-source.Containerfile, unchanged -- it already defaults
+# BASE_IMAGE to mx-llamacpp-mx-llamacpp-ssh.
+#
+# Build (place this file at .devops/mx-llama-rocm10-gfx906.Dockerfile in the
+# mx-llama.cpp-Rocm10 checkout -- .devops/ is where this repo keeps its
+# Dockerfiles -- then run from the checkout root):
+#
+#   cp mx-llama-rocm10-gfx906.Dockerfile .devops/
+#   docker build -f .devops/mx-llama-rocm10-gfx906.Dockerfile \
+#     -t mx-llama-rocm10-gfx906:local .
+#
+# That command is now the whole "update llama.cpp" story. No Hub round trip.
+#
+# ---------------------------------------------------------------------------
+# CORRECTED: the ROCm base is your TheRock build, not a rocm/dev-ubuntu tag
+# ---------------------------------------------------------------------------
+# The earlier version of this file guessed `rocm/dev-ubuntu-24.04:10.0.0-complete`
+# and ARG ROCM_VERSION=10.0.0. Both were wrong, for two reasons:
+#
+#  1. Your ROCm is built by Wizard815/TheRock-gfx906. TheRock is the build system
+#     ROCm itself has used since 7.14, and that fork's version.json says:
+#         {"rocm-version": "10.1.0", "release-metadata": {"base-date": ""}}
+#     while GFX906.md describes its output as "a self-contained ROCm 10 install
+#     tree for gfx906" at build/dist/rocm/.
+#  2. There is no stock tag to point at anyway. Your box reports
+#         rocm-smi 4.0.0+97ab4d1f88  /  ROCM-SMI-LIB version: 7.8.0
+#     which is a cherry-picked tree -- ROCm 7 tooling with bits taken forward
+#     from 10, exactly as you described -- not a release of anything.
+#
+# So the base is your own image, which already carries that tree, and the
+# compile happens inside it. That also makes the compiler and the runtime the
+# same ROCm by construction, which matters more than usual on gfx906: rocBLAS
+# kernels are compiled per architecture and gfx906 is dropped from official
+# support from gfx908 onward.
+
+ARG ROCM_BASE=zenth815/mx-llama-rocm10-gfx906:latest
+
+# gfx906 only. TheRock's own default target list starts at gfx908 and
+# llama.cpp's .devops/rocm.Dockerfile arch list (gfx908;gfx90a;gfx942;
+# gfx1030;...) omits gfx906 entirely, so it must be set explicitly.
+ARG AMDGPU_TARGETS=gfx906
+
+### ---------------------------------------------------------------------------
+### Stage 1: compile
+### ---------------------------------------------------------------------------
+FROM ${ROCM_BASE} AS build
+
+ARG AMDGPU_TARGETS
+ARG ROCM_BASE
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build git libssl-dev curl libgomp1 ca-certificates \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Fail early and legibly if the base is runtime-only. Everything here comes from
+# the TheRock install tree, so this is a report, not something the Dockerfile
+# installs.
+RUN set -eu; \
+    echo "--- ROCm tree ---"; \
+    (cat /opt/rocm/.info/version 2>/dev/null || echo "no /opt/rocm/.info/version"); \
+    (hipconfig --version 2>/dev/null || echo "hipconfig MISSING"); \
+    for f in librocblas libhipblas librccl; do \
+        if ls /opt/rocm/lib/$f.so* >/dev/null 2>&1; then echo "found $f"; \
+        else echo "MISSING $f"; fi; \
+    done; \
+    command -v hipcc >/dev/null \
+      || { echo "FATAL: hipcc not in the base image -- see 'If the base cannot compile' at the end of this file" >&2; exit 1; }
+
+WORKDIR /src
+COPY . .
+
+# Flags are exactly this fork's own recipe (FEATURES.md "Building from source"):
+#   GGML_HIP_GRAPHS / GGML_HIP_RCCL  - the fork's multi-GPU + AllReduce features
+#   HIP_COMPILER=clang               - required for the gfx906 kernel tuning
+#   -O3 + the unused-arg warning off - as documented
+# LLAMA_BUILD_TESTS=OFF is this Dockerfile's addition; nothing here runs
+# llama.cpp's test suite in the image.
+#
+# HIPCXX/HIP_PATH are set the way llama.cpp's own .devops/rocm.Dockerfile does,
+# because a bare `-DGGML_HIP=ON` does not always select the right clang.
+RUN HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+    cmake -S . -B build -GNinja \
+        -DGGML_HIP=ON \
+        -DGGML_HIP_GRAPHS=ON \
+        -DGGML_HIP_RCCL=ON \
+        -DLLAMA_OPENSSL=ON \
+        -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DHIP_COMPILER=clang \
+        -DCMAKE_CXX_FLAGS="-O3 -Wno-unused-command-line-argument" \
+        -DCMAKE_HIP_FLAGS="-mllvm -amdgpu-sched-strategy=max-ilp" \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_CURL=ON \
+    && cmake --build build --config Release -j"$(nproc)" \
+    && mkdir -p /out/bin /out/lib \
+    && cp build/bin/llama-server build/bin/llama-cli build/bin/llama-bench \
+          build/bin/llama-quantize build/bin/llama-gguf /out/bin/ \
+    && find build -name "*.so*" -exec cp -P {} /out/lib/ \;
+
+# A CPU-only server is the standard silent failure when the target or the ROCm
+# tree is wrong: every model loads and then runs on 44 CPU threads. Refuse to
+# produce the image instead.
+RUN ls -1 /out/lib | grep -qi "ggml-hip" \
+    || (echo "FATAL: no ggml-hip backend was built -- check AMDGPU_TARGETS and that rocBLAS has gfx906" >&2; exit 1)
+
+# Record what was built, so `docker run --rm <image> cat /app/versions.txt`
+# answers "which llama.cpp and which ROCm?" -- the question the Hub image could
+# not answer at all.
+RUN { echo "org: Wizard815/mx-llama.cpp-Rocm10"; \
+      echo "rocm_base: ${ROCM_BASE}"; \
+      echo "rocm_tree_version: $(cat /opt/rocm/.info/version 2>/dev/null || echo unknown)"; \
+      echo "therock_rocm_version: 10.1.0 (Wizard815/TheRock-gfx906 version.json)"; \
+      echo "amdgpu_targets: ${AMDGPU_TARGETS}"; \
+      echo "git_commit: $(git rev-parse HEAD 2>/dev/null || echo unknown)"; \
+      echo "git_describe: $(git describe --tags --always --dirty 2>/dev/null || echo unknown)"; \
+      echo "git_date: $(git log -1 --format=%cI 2>/dev/null || echo unknown)"; \
+      echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; } > /out/versions.txt
+
+### ---------------------------------------------------------------------------
+### Stage 2: runtime
+### ---------------------------------------------------------------------------
+# The same image as the build stage, deliberately. rocBLAS/RCCL are per-arch and
+# taking the runtime from anywhere else is the classic way to get a binary that
+# loads and then dies inside a BLAS call.
+FROM ${ROCM_BASE} AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 curl ca-certificates \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /out/bin /app
+COPY --from=build /out/lib /app/lib
+COPY --from=build /out/versions.txt /app/versions.txt
+
+ENV PATH="/app:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    LD_LIBRARY_PATH="/app/lib:/opt/rocm/lib" \
+    ROCM_PATH="/opt/rocm" \
+    HIP_PATH="/opt/rocm" \
+    HF_HOME="/app/models/HFCache" \
+    HUGGINGFACE_HUB_CACHE="/app/models/HFCache/hub" \
+    HF_HUB_CACHE="/app/models/HFCache/hub" \
+    # Recommended for gfx906 by this fork's FEATURES.md, baked in so every
+    # container built on this image gets them without repeating them in compose.
+    # HSA_OVERRIDE_GFX_VERSION is deliberately NOT set: a build that targets
+    # gfx906 already knows the part.
+    HSA_FORCE_FINE_GRAIN_PCIE="1" \
+    GPU_MAX_HW_QUEUES="8" \
+    LLAMA_ENABLE_MTP_OPT="1"
+
+# Same two lines your old appdata Dockerfile added, so the loader finds the ROCm
+# and /app libraries without depending on LD_LIBRARY_PATH surviving into every
+# exec context (tmux, sshd, docker exec).
+RUN echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf \
+    && echo "/app/lib" > /etc/ld.so.conf.d/llama-app.conf \
+    && ldconfig
+
+WORKDIR /app
+ENTRYPOINT ["/app/llama-server"]
+
+# ---------------------------------------------------------------------------
+# If the base cannot compile
+# ---------------------------------------------------------------------------
+# The build stage exits early with "hipcc not in the base image" if
+# zenth815/mx-llama-rocm10-gfx906 turns out to be runtime-only. Two ways out,
+# both using the TheRock tree you already know how to build:
+#
+#  1. Use a TheRock artifacts tree as the build base. From GFX906.md:
+#         cd /path/to/TheRock-gfx906
+#         python3 -m venv .venv && source .venv/bin/activate
+#         pip install -r requirements.txt
+#         pip install meson==1.11.2   # 1.12.0 has a duplicate --version-script bug
+#         python3 ./build_tools/fetch_sources.py
+#         eval "$(./build_tools/setup_ccache.py)"
+#         export CMAKE_BUILD_PARALLEL_LEVEL=4   # -j does NOT propagate to nested
+#                                               # per-subproject cmake --build
+#         cmake -B build -GNinja -DTHEROCK_AMDGPU_FAMILIES=gfx906 \
+#               -DTHEROCK_TEST_AMDGPU_TARGETS=gfx906 \
+#               -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+#               -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+#         ninja -C build -j4
+#         ninja -C build artifacts
+#         ninja -C build archives
+#     Output is build/dist/rocm/ -- copy that onto /opt/rocm in the build stage.
+#
+#  2. Skip the two-stage split: build in the TheRock tree on the host and copy
+#     build/bin into the runtime image. Simpler, less reproducible.
+#
+# THEROCK_TEST_AMDGPU_TARGETS=gfx906 (not the default, which builds RCCL for ~24
+# architectures) is what scopes RCCL to gfx906 and keeps the build tractable.

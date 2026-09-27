@@ -1,0 +1,31 @@
+# Stage 2 of the self-build chain: replaces
+# /mnt/user/appdata/mx-llamacpp/Dockerfile.mx-llamacpp-ssh
+#
+# The ONLY change from your current file is the first line: it no longer pulls
+# zenth815/mx-llama-rocm10-gfx906:latest from Docker Hub, it builds on the image
+# you compiled yourself.
+#
+# The ROCm paths, HF_HOME/HUGGINGFACE_HUB_CACHE environment, and the ld.so.conf
+# entries all moved into stage 1 (Dockerfile.mx-llama-rocm10-gfx906), where they
+# belong -- they describe the llama.cpp build, not the ssh layer. Inheriting them
+# from the base image is enough; repeating them here just risks the two copies
+# drifting apart.
+#
+# Build (from /mnt/user/appdata/mx-llamacpp, same as before):
+#   docker compose up -d --build
+
+FROM mx-llama-rocm10-gfx906:local
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-server python3 python3-pip tmux ca-certificates \
+    && mkdir -p /run/sshd \
+    && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+    && sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+COPY entrypoint.sh /entrypoint.sh
+COPY serve.sh /usr/local/bin/serve
+RUN chmod +x /entrypoint.sh /usr/local/bin/serve
+
+EXPOSE 22
+ENTRYPOINT ["/entrypoint.sh"]

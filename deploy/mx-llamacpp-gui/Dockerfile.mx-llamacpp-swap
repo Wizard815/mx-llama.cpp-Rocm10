@@ -1,0 +1,23 @@
+# One container: ROCm/gfx906 llama.cpp + llama-swap + sshd.
+#
+# Built on YOUR existing llama-swap image, which is already
+# `mx-llamacpp-mx-llamacpp-ssh:latest` + the llama-swap binary at /app/llama-swap
+# (see docker/llama-swap-source.Containerfile in llama-swap-rescan). sshd is
+# present because it is inherited from that base - nothing to install.
+#
+# Result: llama-swap is PID 1, so `docker logs -f mx-llamacpp-gui` shows the
+# proxy log AND every llama-server it spawns, and the same logs are in the GUI.
+FROM llama-swap-rescan:local
+
+USER root
+
+RUN mkdir -p /run/sshd /app/logs /root/.ssh \
+    && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+    && sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+
+COPY entrypoint.sh /entrypoint.sh
+COPY config.yaml /app/config.yaml
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 22 8080
+ENTRYPOINT ["/entrypoint.sh"]

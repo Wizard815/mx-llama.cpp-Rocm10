@@ -1,0 +1,45 @@
+# llama-swap config for the standalone mx-llamacpp container.
+# Same shape as /mnt/user/appdata/llamaswap/deploy/config.yaml, trimmed down to
+# just this box's ROCm llama-server. Flags come from the confirmed live
+# llama-server command line (deploy/config.yaml.example).
+#
+# Edit this file on the host and `docker compose restart` to apply -
+# -watch-config on the llama-swap command line also picks it up live.
+
+healthCheckTimeout: 120
+logLevel: info
+
+macros:
+  rocm-llama-server: >
+    llama-server --host 0.0.0.0 --port ${PORT}
+    -ngl 99 -c 262144 --flash-attn on
+    --cache-type-k q8_0 --cache-type-v q8_0
+    --fit off --split-mode layer --jinja
+    --log-prefix
+
+  # Embedding-only GGUFs (nomic-embed-*) - --embedding stops llama-server
+  # serving /v1/chat/completions, so keep it out of the chat macro above.
+  rocm-llama-server-embed: >
+    llama-server --host 0.0.0.0 --port ${PORT}
+    -ngl 99 --embedding --pooling mean
+
+# Auto-discover every GGUF under /app/models and write entries to
+# /app/config.d/models.generated.yaml - same modelscan feature as the
+# production llama-swap container.
+modelScan:
+  enabled: true
+  dirs:
+    - /app/models
+  outputFile: /app/config.d/models.generated.yaml
+  cmdTemplate: >
+    ${rocm-llama-server} -m ${MODEL_PATH}
+  groups:
+    - match: "nomic-embed"
+      dirs:
+        - /app/models
+      cmdTemplate: >
+        ${rocm-llama-server-embed} -m ${MODEL_PATH}
+      outputFile: /app/config.d/models.embeddings.generated.yaml
+
+# How long an idle model stays loaded before llama-swap unloads it.
+globalTTL: 900
