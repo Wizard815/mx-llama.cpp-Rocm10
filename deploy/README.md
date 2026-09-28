@@ -69,12 +69,20 @@ cp .../deploy/mx-llamacpp-gui/* /mnt/user/appdata/mx-llamacpp-gui/
 docker compose -f /mnt/user/appdata/mx-llamacpp-gui/docker-compose.yml up -d --build
 ```
 
-Two things to know before starting it:
+Three things to know before starting it:
 
-- It maps 2222, 8000, 8001 and 8002, the same ports as `mx-llamacpp-ssh`, so stop
-  that container first or drop those mappings.
-- The compose mounts `/mnt/user/appdata/mx-llamacpp/config.yaml` and
-  `/mnt/user/appdata/mx-llamacpp/config.d`, so the two containers share one
-  config. The `config.yaml` in this directory is the pre-tuning one
-  (`healthCheckTimeout: 120`, `-c 262144`, `--fit off`); the tuned config lives in
-  the `llama-swap-rescan` repository under `deploy/`.
+- It maps **only `8643`** (the GUI). The ssh container already holds 2222 and
+  8000-8002, and a second bind on one of those fails the start outright with
+  `Bind for 0.0.0.0:2222 failed: port is already allocated`. Use
+  `docker exec -it mx-llamacpp-gui sh` for a shell instead.
+- Copy the config in before the first start:
+  `cp deploy/mx-llamacpp-gui/config.yaml /mnt/user/appdata/mx-llamacpp/config.yaml`.
+  A bind-mounted *file* that does not exist is created as a **directory**, and the
+  container then fails confusingly. That file is the tuned config with the
+  `odysseus:` and `routing:` blocks removed: this container does not mount
+  Odysseus' state directory, and its `/app/config.d` starts empty (a routing group
+  naming a model with no config blocks startup, and the fragments only appear
+  after the first listing or `POST /api/models/rescan`). Add the routing block
+  back once `config.d` is populated if you want the same group policy here.
+- Both llama-swap containers share the two MI50s, so run this one as a sandbox —
+  under load the two will contend for VRAM with the production container.

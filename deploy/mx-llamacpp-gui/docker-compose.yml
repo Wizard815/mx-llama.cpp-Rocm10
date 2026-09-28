@@ -19,11 +19,11 @@ services:
       - /mnt/user/appdata/mx-llamacpp/config.d:/app/config.d
       - /mnt/user/appdata/mx-llamacpp/logs:/app/logs
     ports:
-      - "2222:22"
+      # Only the GUI. The ssh container already holds 2222 and 8000-8002, and a
+      # second bind on one of those fails the start outright:
+      #   Bind for 0.0.0.0:2222 failed: port is already allocated
+      # Use `docker exec -it mx-llamacpp-gui sh` for a shell in here.
       - "8643:8080"    # llama-swap GUI  ->  http://192.168.20.5:8643/ui
-      - "8000:8000"    # stayed open for a hand-run llama-server
-      - "8001:8001"
-      - "8002:8002"
     environment:
       - HUGGINGFACE_HUB_CACHE=/app/models/HFCache/hub
       - ROCM_PATH=/opt/rocm

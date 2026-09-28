@@ -1,45 +1,278 @@
-# llama-swap config for the standalone mx-llamacpp container.
-# Same shape as /mnt/user/appdata/llamaswap/deploy/config.yaml, trimmed down to
-# just this box's ROCm llama-server. Flags come from the confirmed live
-# llama-server command line (deploy/config.yaml.example).
+# Config for the sandbox llama-swap container (mx-llamacpp-gui).
 #
-# Edit this file on the host and `docker compose restart` to apply -
-# -watch-config on the llama-swap command line also picks it up live.
+# It is the tuned config with two blocks removed, for two concrete reasons:
+#
+#   odysseus:  this container does not mount Odysseus' state directory
+#              (/mnt/user/appdata/odysseus/data), so the integration would log
+#              "reading odysseus.stateFile ..." every refresh and never produce a
+#              profile. The production llama-swap container owns that integration.
+#
+#   routing:   /app/config.d starts EMPTY here, and a routing group that names a
+#              model with no config blocks startup:
+#                ERROR creating group router: no model config for "..."
+#              with restart: unless-stopped that becomes a crash loop. The
+#              fragments only appear after the container serves its first model
+#              listing or a POST /api/models/rescan. Add the block back from
+#              deploy/config.yaml.example once /app/config.d is populated if you
+#              want the same gpu0/gpu1/heavy/services policy in the sandbox.
+#
+# Everything else is the tuned config: healthCheckTimeout 300, logToStdout both,
+# -lm dio, no --fit off, the 262144 window for ungrouped (heavy) models, and the
+# five modelScan groups with their own windows.
+#
 
-healthCheckTimeout: 120
+# Deploy config for the modelscan fork on RaidLab.
+#
+# Copy it over the live file once:
+#
+#   cp deploy/config.yaml deploy/config.yaml.bak
+#   cp deploy/config.yaml.example deploy/config.yaml
+#   docker restart llama-swap
+#
+# deploy/config.yaml is gitignored (it is the live file, holding this box's real
+# paths), so `git pull` never updates it -- re-copy or merge this file by hand
+# when the tuning here changes.
+#
+# FIRST APPLICATION TAKES TWO STEPS. The routing groups name models that only
+# exist once the new modelScan groups below have run, and llama-swap refuses to
+# start while a group names a model it has no config for:
+#
+#   ERROR creating group router: no model config for "..."
+#
+# So apply it in this order:
+#
+#   1. start with the `routing:` block removed (leave it commented out), then
+#        curl -X POST http://192.168.20.5:8642/api/models/rescan
+#      Run it again if /app/config.d/models.gpu1.generated.yaml or
+#      models.embeddings.generated.yaml have not appeared -- one listing or
+#      rescan does not always finish every group. Confirm the scan is clean:
+#        cd /mnt/user/appdata/llamaswap/deploy/config.d
+#        grep -hE '^  [a-z0-9]' models.*.generated.yaml | sort | uniq -d
+#      Printed names are models two groups both claimed; that fails the config
+#      load and must be fixed before continuing.
+#   2. add the `routing:` block back and restart. From then on one restart is
+#      enough, because the generated fragments stay on disk.
+#
+# The group members were checked against the GGUF files actually present in
+# /app/models. The five gemma4-coding-* models an earlier draft listed are not
+# there any more, and a member with no model config blocks startup completely,
+# so they are deliberately not listed below; re-add them with the files.
+#
+# Requires the modelscan `env:`/`ttl:` extension in internal/modelscan/scan.go
+# (commit 65b3100, on main). An unpatched binary ignores both keys and falls
+# back to the plain cmdTemplate for every model -- it still loads, you just lose
+# per-model device pinning and the keep-resident flags.
+healthCheckTimeout: 300
+# WAS 120. Your log shows `starting ornith-1.0-35b-a3b-... failed: health check
+# timed out after 2m0s` -- llama-swap was killing models that were still
+# loading. 300s is a working load plus margin.
+
+globalTTL: 900
+
 logLevel: info
 
+logToStdout: both
+# WAS unset. Unset/empty behaves as `proxy`, which routes the upstream
+# llama-server log to io.Discard: it is kept in memory for the GUI's viewer but
+# never written to stdout, so it never reaches `docker logs` and therefore never
+# reaches Unraid's /logterminal/llama-swap.log/. `both` = proxy + upstream.
+# Source: internal/server/log.go NewLoggers().
+
+# -c is the context window llama-server allocates for every launch that uses this
+# macro, and the whole KV cache for it is allocated at load.
+#
+# This macro feeds the PRIMARY scan only, which claims the models that need both
+# cards (the 35B-119B classes in the `heavy` routing group). They never coexist
+# with anything -- heavy is swap+exclusive -- so a large window costs load time
+# and VRAM, not concurrency. Size it for the longest conversation you actually
+# run: at 32768 an agent session was rejected with
+#
+#   request (175224 tokens) exceeds the available context size (32768 tokens)
+#
+# 262144 is the window these sessions were sized against before. 131072 is a fair
+# trade if you also let the client compact (Hermes: compression.enabled) instead
+# of sending the whole history.
+#
+# The small models do not use this macro: every modelScan group below carries its
+# own -c (search12b and MTP at 16384, embeddings at 8192), which is what lets them
+# coexist on one card.
 macros:
   rocm-llama-server: >
     llama-server --host 0.0.0.0 --port ${PORT}
-    -ngl 99 -c 262144 --flash-attn on
+    -ngl 99 -c 262144
+    --flash-attn on
     --cache-type-k q8_0 --cache-type-v q8_0
-    --fit off --split-mode layer --jinja
-    --log-prefix
+    -lm dio
+    --split-mode layer --jinja
 
-  # Embedding-only GGUFs (nomic-embed-*) - --embedding stops llama-server
-  # serving /v1/chat/completions, so keep it out of the chat macro above.
-  rocm-llama-server-embed: >
-    llama-server --host 0.0.0.0 --port ${PORT}
-    -ngl 99 --embedding --pooling mean
+  # --fit off was REMOVED. fit_params defaults to true (common/common.h:482)
+  # and --fit off disabled the auto-fitting that shrinks unset args when a
+  # layout does not fit. Combined with one large -c applied to every model it is
+  # what made a 2B model allocate the same KV as a 35B one, on both cards, on
+  # every load -- most of why two models could not coexist, and most of why each
+  # swap cost so much. With --fit on, the window below only has to be honest
+  # about the heavy models, which is why the small ones are peeled into their own
+  # scan groups with their own -c.
+  #
+  # -lm dio is REQUIRED on this stack. FEATURES.md: "Always pass -lm dio
+  # (--load-mode dio). mmap on the model file hangs on this stack." Your macro
+  # did not pass it. If you have seen loads hang or never finish, this is the
+  # first thing to fix.
 
-# Auto-discover every GGUF under /app/models and write entries to
-# /app/config.d/models.generated.yaml - same modelscan feature as the
-# production llama-swap container.
 modelScan:
   enabled: true
   dirs:
     - /app/models
   outputFile: /app/config.d/models.generated.yaml
+  # Everything not claimed by a group below gets BOTH cards in layer mode --
+  # the right default for the 30B-119B models.
   cmdTemplate: >
     ${rocm-llama-server} -m ${MODEL_PATH}
+
+  # ---------------------------------------------------------------------------
+  # Scan-group patterns MUST NOT OVERLAP.
+  #
+  # A group's `match` is only excluded from the *primary* scan
+  # (internal/server/modelscan_api.go collects groupMatches into the primary's
+  # ExcludePatterns and nothing else). Two groups matching the same file emit
+  # the same model ID into two generated files, and llama-swap's config-dir
+  # merge rejects duplicate model names -- which fails the whole config load.
+  #
+  # So when you peel a model out into its own group, remove its pattern from the
+  # broader group it came from. Verify after every rescan:
+  #
+  #   cd /mnt/user/appdata/llamaswap/deploy/config.d
+  #   grep -hE '^  [a-z0-9]' models.*.generated.yaml | sort | uniq -d
+  #
+  # Empty output = no duplicates. Anything printed is a model two groups both
+  # claimed, and llama-swap will refuse the config until you fix it.
+  # ---------------------------------------------------------------------------
   groups:
+    # ---- the 12B quick-search model: small context, pinned, always resident ---
+    # You asked for 12K-20K instead of 262144. 16384 with --fit on means it
+    # loads fast and holds little VRAM, so it never queues behind anything.
+    # ttl: 0 is what actually keeps it in memory -- see the note on the
+    # `services` routing group below for why persistent alone is not enough.
+    #
+    # Pattern `gemma-4-12b-it-ud` deliberately does NOT match the MTP model
+    # below (that file is `mtp-gemma-4-12b-it-q8_0` -- no `-ud`).
+    - match: "gemma-4-12b-it-ud"
+      dirs:
+        - /app/models
+      env:
+        # Pinning by device *visibility* is more airtight than --main-gpu: with
+        # only one device visible, llama.cpp cannot pick the other one at all.
+        - "HIP_VISIBLE_DEVICES=0"
+      ttl: 0
+      cmdTemplate: >
+        llama-server --host 0.0.0.0 --port ${PORT}
+        -ngl 99 -c 16384 --flash-attn on
+        --cache-type-k q8_0 --cache-type-v q8_0
+        -lm dio --split-mode none --jinja
+        -m ${MODEL_PATH}
+      outputFile: /app/config.d/models.search12b.generated.yaml
+
+    # ---- the one model that wants MTP speculative decoding ----
+    # This is the "add -spec-type draft-mtp to just this model" case. Your own
+    # config note says it must not go in the shared macro, because it is
+    # architecture-specific to the MTP variant and would break the other ~25.
+    - match: "mtp-gemma"
+      dirs:
+        - /app/models
+      env:
+        - "HIP_VISIBLE_DEVICES=0"
+        # Per-model env, which is what you asked for. This flag is only
+        # meaningful for the model that actually has an MTP head, so setting it
+        # container-wide is noise on the other 30 models. (The self-build image
+        # also bakes it in globally; an explicit entry here wins.)
+        - "LLAMA_ENABLE_MTP_OPT=1"
+      cmdTemplate: >
+        llama-server --host 0.0.0.0 --port ${PORT}
+        -ngl 99 -c 16384 --flash-attn on
+        --cache-type-k q8_0 --cache-type-v q8_0
+        -lm dio --split-mode none --jinja
+        --spec-type draft-mtp --spec-draft-n-max 3
+        -m ${MODEL_PATH}
+      outputFile: /app/config.d/models.mtp.generated.yaml
+
+    # ---- GPU 0: small dense models ----
+    # Note this no longer contains `12b-it` or `mtp`: both moved into the two
+    # groups above, and leaving them here would double-claim those files.
+    - match: "(e2b|e4b|qwen3\\.5-2b|qwen2\\.5-3b|bonsai-8b|hermes-4-14b|hermes-q4_k_m|hermes-tools)"
+      dirs:
+        - /app/models
+      env:
+        - "HIP_VISIBLE_DEVICES=0"
+      cmdTemplate: >
+        llama-server --host 0.0.0.0 --port ${PORT}
+        -ngl 99 -c 32768 --flash-attn on
+        --cache-type-k q8_0 --cache-type-v q8_0
+        -lm dio --split-mode none --jinja
+        -m ${MODEL_PATH}
+      outputFile: /app/config.d/models.gpu0.generated.yaml
+
+    # ---- GPU 1: one-card mid models ----
+    - match: "(gemma4-coding|31b-it|27b-ud)"
+      dirs:
+        - /app/models
+      env:
+        - "HIP_VISIBLE_DEVICES=1"
+      cmdTemplate: >
+        llama-server --host 0.0.0.0 --port ${PORT}
+        -ngl 99 -c 32768 --flash-attn on
+        --cache-type-k q8_0 --cache-type-v q8_0
+        -lm dio --split-mode none --jinja
+        -m ${MODEL_PATH}
+      outputFile: /app/config.d/models.gpu1.generated.yaml
+
+    # ---- embeddings: tiny, pinned, never unloaded ----
+    # ttl: 0 is the real "always resident" switch -- this model is never a TTL
+    # unload candidate. Combined with the persistent routing group below, the
+    # embeddings survive a 35B model loading on top of them.
     - match: "nomic-embed"
       dirs:
         - /app/models
+      env:
+        - "HIP_VISIBLE_DEVICES=0"
+      ttl: 0
       cmdTemplate: >
-        ${rocm-llama-server-embed} -m ${MODEL_PATH}
+        llama-server --host 0.0.0.0 --port ${PORT}
+        -ngl 99 -c 8192 --embedding --pooling mean
+        -lm dio --split-mode none
+        -m ${MODEL_PATH}
       outputFile: /app/config.d/models.embeddings.generated.yaml
 
-# How long an idle model stays loaded before llama-swap unloads it.
-globalTTL: 900
+# -----------------------------------------------------------------------------
+# Concurrency
+# -----------------------------------------------------------------------------
+# Out of the box llama-swap runs ONE model at a time, instance-wide (the
+# implicit default group is swap: true + exclusive: true), so requesting model B
+# unloads model A. Two prompts on the *same* model are fine -- those are two
+# slots of one process -- but alternating models thrashes: unload A, load B,
+# unload B, load A, with a multi-GB GGUF re-read each time. That is the 10x.
+#
+#   swap       true = one member at a time;  false = members coexist
+#   exclusive  true = loading a member unloads every OTHER group
+#   persistent true = no other group can ever unload this one
+#
+# Also verified in the source (internal/router/group.go:93, base.go:387-390):
+#   - `persistent` only stops other groups from *choosing* these as eviction
+#     targets. It is not a residency guarantee: a TTL unload, a manual
+#     POST /api/models/unload, or the group's own swap rule still stops them.
+#     That is why the embeddings and the 12B also carry `ttl: 0` above -- the
+#     two flags do different jobs and you want both.
+#   - Nothing anywhere waits for an in-flight request. Unload "does not wait
+#     for in-flight requests"; Stop kills the upstream and the caller sees an
+#     error. So there is no "finish the embeds first, then free the memory"
+#     behaviour to rely on. Keeping the small models resident is the only way
+#     to avoid that.
+# -----------------------------------------------------------------------------
+# Odysseus integration
+# -----------------------------------------------------------------------------
+# Kept from the live config: llama-swap reads Odysseus' saved Cookbook configs
+# and generates the per-model launch variants under /app/config.d/odysseus.generated.yaml,
+# which is what the `ody` profile pins. The mount lives in docker-compose.yml;
+# the state directory has to be traversable by this container's uid or every
+# refresh logs "reading odysseus.stateFile ... permission denied" and the
+# profiles never appear (GET /api/profiles reports active: null).
+#   chmod 711 /mnt/user/appdata/odysseus/data
