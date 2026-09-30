@@ -1609,7 +1609,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    // Backend sampling needs the logits on one device. A mirrored output
+    // (mxxm.tensor_mirror_output) keeps the full vocabulary on every lane.
+    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !model.tensor_mirror_output()) {
         static bool warned = false;
         if (!warned) {
             LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
