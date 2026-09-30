@@ -792,6 +792,7 @@ static bool ggml_backend_meta_op_needs_full_rows(const struct ggml_tensor * tens
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
+        case GGML_OP_TURBO_WHT:
         case GGML_OP_GROUP_NORM:
         case GGML_OP_L2_NORM:
         case GGML_OP_ARGSORT:
@@ -1303,6 +1304,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_RMS_NORM_BACK:
             case GGML_OP_GROUP_NORM:
             case GGML_OP_L2_NORM: {
+                split_state = handle_per_row(src_ss);
+            } break;
+            case GGML_OP_TURBO_WHT: {
+                // Turbo KV rotates 128-element groups along ne[0] (turbo-quant.cu), so a
+                // source split on axis 0 would cut a group in half and the rotation would
+                // be wrong on that lane. Same shape class as the norms above: the
+                // needs-full-rows pass gathers an axis-0 source before this node runs,
+                // and handle_per_row reports the MIRRORED result that leaves behind.
+                // For an axis >= 1 split (per head) every lane still owns whole rows,
+                // so the source's split carries over unchanged.
                 split_state = handle_per_row(src_ss);
             } break;
             case GGML_OP_MUL_MAT:
