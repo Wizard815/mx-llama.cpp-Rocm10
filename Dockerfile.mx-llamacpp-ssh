@@ -21,4 +21,10 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 EXPOSE 22
+
+# The inherited llama-server HTTP healthcheck fails whenever this SSH-only
+# sidecar is idle; this container is healthy when its SSH daemon listens.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python3 -c "import socket; socket.create_connection(('127.0.0.1', 22), timeout=2).close()"
+
 ENTRYPOINT ["/entrypoint.sh"]
