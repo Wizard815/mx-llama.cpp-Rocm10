@@ -621,19 +621,25 @@ void tp_custom_ar_init(CustomARContext * ctx, int nranks, const int * dev_ids) {
             if (i == j) continue;
             int can_access = 0;
             CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, ctx->dev_ids[i], ctx->dev_ids[j]));
-            if (can_access) {
-                cudaError_t err = cudaDeviceEnablePeerAccess(ctx->dev_ids[j], 0);
-                if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
+
+            // HIP's probe is advisory: it reports 0 for pairs that do support peer DMA (RCCL uses dmabuf imports instead), so let the enable call decide.
+            cudaError_t err = cudaDeviceEnablePeerAccess(ctx->dev_ids[j], 0);
+            if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
+                if (can_access) {
                     CUDA_CHECK(err);
+                }
+                GGML_LOG_WARN("TP custom AR: peer access not available between GPU %d and %d\n",
+                              ctx->dev_ids[i], ctx->dev_ids[j]);
+                peer_access_ok = false;
+            } else {
+                if (!can_access) {
+                    GGML_LOG_INFO("TP custom AR: peer access %d -> %d enabled, probe said no\n",
+                                  ctx->dev_ids[i], ctx->dev_ids[j]);
                 }
                 // cudaDeviceEnablePeerAccess leaves the sticky error state set when access
                 // was already enabled. Clear it here so the first downstream cudaGetLastError()
                 // (e.g. after a MUL_MAT kernel) doesn't trip on it.
                 (void) cudaGetLastError();
-            } else {
-                GGML_LOG_WARN("TP custom AR: peer access not available between GPU %d and %d\n",
-                              ctx->dev_ids[i], ctx->dev_ids[j]);
-                peer_access_ok = false;
             }
         }
     }
