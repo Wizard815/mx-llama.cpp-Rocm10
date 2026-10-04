@@ -622,8 +622,12 @@ void tp_custom_ar_init(CustomARContext * ctx, int nranks, const int * dev_ids) {
             int can_access = 0;
             CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, ctx->dev_ids[i], ctx->dev_ids[j]));
 
-            // HIP's probe is advisory: it reports 0 for pairs that do support peer DMA (RCCL uses dmabuf imports instead), so let the enable call decide.
+            // Ask for peer access unconditionally: where there is no P2P the probe
+            // and the enable call agree, and the enable call is what the AR needs.
             cudaError_t err = cudaDeviceEnablePeerAccess(ctx->dev_ids[j], 0);
+            // The call sets the sticky error state both on failure and when access
+            // was already enabled, so clear it before the next cudaGetLastError().
+            (void) cudaGetLastError();
             if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
                 if (can_access) {
                     CUDA_CHECK(err);
@@ -631,15 +635,9 @@ void tp_custom_ar_init(CustomARContext * ctx, int nranks, const int * dev_ids) {
                 GGML_LOG_WARN("TP custom AR: peer access not available between GPU %d and %d\n",
                               ctx->dev_ids[i], ctx->dev_ids[j]);
                 peer_access_ok = false;
-            } else {
-                if (!can_access) {
-                    GGML_LOG_INFO("TP custom AR: peer access %d -> %d enabled, probe said no\n",
-                                  ctx->dev_ids[i], ctx->dev_ids[j]);
-                }
-                // cudaDeviceEnablePeerAccess leaves the sticky error state set when access
-                // was already enabled. Clear it here so the first downstream cudaGetLastError()
-                // (e.g. after a MUL_MAT kernel) doesn't trip on it.
-                (void) cudaGetLastError();
+            } else if (!can_access) {
+                GGML_LOG_INFO("TP custom AR: peer access %d -> %d enabled, probe said no\n",
+                              ctx->dev_ids[i], ctx->dev_ids[j]);
             }
         }
     }
