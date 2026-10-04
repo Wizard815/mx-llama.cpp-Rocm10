@@ -153,3 +153,10 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Local deployment values: host paths and secrets. Copy the .env.example next
+# to each compose file to .env and leave it untracked.
+
+.env
+docker-compose.override.yml
+docker-compose.override.yaml

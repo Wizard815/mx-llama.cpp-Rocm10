@@ -12,12 +12,11 @@ services:
       - video
       - "18"
     volumes:
-      - /mnt/user/appdata/odysseus/data/ssh/id_ed25519.pub:/run/secrets/authorized_key:ro
-      - /mnt/user/OnePiece/HomeLab/LLMBin:/app/models
+      - ${ODYSSEUS_SSH_KEY:?set ODYSSEUS_SSH_KEY in .env}:/run/secrets/authorized_key:ro
+      - ${MODELS_DIR:?set MODELS_DIR in .env}:/app/models
       # NEW: persistent llama-server logs, readable from the host without
-      # needing docker logs:
-      #   tail -f /mnt/user/appdata/mx-llamacpp/logs/llama-server.log
-      - /mnt/user/appdata/mx-llamacpp/logs:/app/logs
+      # needing docker logs (host path: ${LLAMACPP_APPDATA}/logs/llama-server.log):
+      - ${LLAMACPP_APPDATA:?set LLAMACPP_APPDATA in .env}/logs:/app/logs
     ports:
       - "2222:22"
       - "8000:8000"

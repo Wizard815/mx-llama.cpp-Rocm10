@@ -60,7 +60,7 @@ cp /path/to/self-build/Dockerfile.mx-llamacpp-ssh .
 docker compose up -d --build
 
 # 5. rebuild llama-swap on top
-cd /mnt/user/OnePiece/HomeLab/llamaswap
+cd /mnt/user/appdata/llamaswap
 docker build -f docker/llama-swap-source.Containerfile -t llama-swap-rescan:local .
 cd deploy && docker compose up -d
 ```
