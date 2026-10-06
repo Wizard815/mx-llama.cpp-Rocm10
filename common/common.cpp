@@ -1340,21 +1340,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    // these decision models return a score for each token via the embeddings output
-    // TODO: maybe improve this in the future
-    const auto decision_type = common_get_decision_type(model);
-    if (decision_type == COMMON_DECISION_TYPE_LAYA || decision_type == COMMON_DECISION_TYPE_KEV || decision_type == COMMON_DECISION_TYPE_CLEF) {
-        params.embedding    = true;
-        params.pooling_type = LLAMA_POOLING_TYPE_NONE;
-
-        cparams.embeddings            = true;
-        cparams.pooling_type          = LLAMA_POOLING_TYPE_NONE;
-        cparams.n_outputs_max         = cparams.n_batch;
-        cparams.n_outputs_max_per_seq = 1;
-
-        LOG_INF("%s", "decision model reads the embeddings output, enabling embedding mode\n");
-    }
-
     // embeddings need the whole batch in one ubatch, so n_batch must not be larger than n_ubatch
     // (server.cpp does this check for --embedding, but before the model is loaded)
     if (cparams.embeddings && cparams.n_batch > cparams.n_ubatch) {
