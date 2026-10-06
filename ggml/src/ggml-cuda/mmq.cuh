@@ -218,8 +218,6 @@ struct ggml_cuda_mmq_config {
 #include "mmq-config-ampere.cuh"
 #include "mmq-config-blackwell.cuh"
 
-#include "mmq-config-gcn.cuh"
-#include "mmq-config-gfx906.cuh" // gfx906 wraps gcn, must be included after it
 #include "mmq-config-cdna.cuh"
 #include "mmq-config-rdna2.cuh"
 #include "mmq-config-rdna3.cuh"
