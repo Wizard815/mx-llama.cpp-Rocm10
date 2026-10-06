@@ -900,6 +900,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
            (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL)))) {
             return src_ss[0]; // GGML_OP_ADD_ID
         }
+        // A MIRRORED operand is present in full on every backend, so an elementwise op
+        // between a MIRRORED operand and one split on a real dim can take the split
+        // one's state, in either order and with no transfer. This is what the gated
+        // attention output needs under -sm tensor with turbo KV, where attn_pregate
+        // comes back MIRRORED while gate_sigmoid is split along dim 0 (attn_gated, MUL).
+        const bool src0_real = src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS;
+        const bool src1_real = src_ss[1].axis >= 0 && src_ss[1].axis < GGML_MAX_DIMS;
+        const bool src0_mirrored = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+        const bool src1_mirrored = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+        if ((src0_mirrored && src1_real) || (src1_mirrored && src0_real)) {
+            return src0_real ? src_ss[0] : src_ss[1];
+        }
         GGML_ASSERT(tensor->src[2] == nullptr || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
