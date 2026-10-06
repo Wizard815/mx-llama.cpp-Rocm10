@@ -80,17 +80,8 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmf*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
-if (GGML_CUDA_FA_ALL_QUANTS)
-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*.cu")
-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
-    add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
-else()
-    list(APPEND GGML_SOURCES_ROCM
-        ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
-endif()
+ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
 # TurboQuant FA template instances (always compiled, regardless of GGML_CUDA_FA_ALL_QUANTS).
 # Guarded by "if (NOT GGML_CUDA_FA_ALL_QUANTS)" to avoid appending (and double-compiling)
