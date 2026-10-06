@@ -296,9 +296,7 @@ struct server_lru_sched {
             SRV_INF("request for name=%s joined the queue, %d waiting\n", model_id.c_str(), e->n_waiters);
             return;
         }
-        // every load now goes through the queue (#29217), so this is not only
-        // about models_max being reached - keep the message generic
-        queue.push_back({ model_id, 1, false, false });
+        queue.push_back({ model_id, 1, false });
         SRV_INF("request for name=%s queued at position %zu\n",
                 model_id.c_str(), queue.size());
     }
@@ -392,12 +390,8 @@ struct server_lru_sched {
   private:
     struct entry_t {
         std::string model_id;
-        int  n_waiters;    // requests waiting for this model
-        bool slot_pending; // a model is already being evicted for this entry
-        bool loading;      // one of the waiters is doing the load right now
-
-        // a slot is already coming, or already taken by the load in flight
-        bool needs_slot() const { return !slot_pending && !loading; }
+        int  n_waiters; // requests waiting for this model
+        bool loading;   // one of the waiters is doing the load right now
     };
 
     entry_t * find(const std::string & model_id) {
@@ -1201,115 +1195,8 @@ void server_models::load(const std::string & name, const load_options & opts) {
         }
     }
 
-    // start a thread to manage the child process
-    // captured variables are guaranteed to be destroyed only after the thread is joined
-    inst.th = std::thread([
-        this, name,
-        child_proc = inst.subproc,
-        port = inst.meta.port,
-        stop_timeout = inst.meta.stop_timeout,
-        child_mode = opts.mode
-    ]() {
-        FILE * stdin_file = child_proc->sproc.stdin_file();
-        FILE * stdout_file = child_proc->sproc.stdout_file(); // combined stdout/stderr
-
-        std::thread log_thread([&]() {
-            // read stdout/stderr and forward to main server log
-            // also handle status report from child process
-            std::vector<char> vec_buf(128 * 1024); // large buffer for storing info
-            char * buffer = vec_buf.data();
-            if (stdout_file) {
-                while (fgets(buffer, vec_buf.size(), stdout_file) != nullptr) {
-                    std::string str(buffer);
-                    if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_STATE)) {
-                        LOG_DBG("[%5d] %s", port, buffer); // prevent spamming the log
-                        this->handle_child_state(name, str);
-                    } else {
-                        // forward log
-                        LOG("[%5d] %s", port, buffer);
-                    }
-                }
-            } else {
-                SRV_ERR("failed to get stdout/stderr of child process for name=%s\n", name.c_str());
-            }
-        });
-
-        std::thread stopping_thread([&]() {
-            // thread to monitor explicit stop requests; child crash is signalled via child_proc->stopped
-            auto is_stopping = [this, &name]() {
-                return this->stopping_models.find(name) != this->stopping_models.end();
-            };
-            {
-                std::unique_lock<std::mutex> lk(this->mutex);
-                this->cv_stop.wait(lk, [&]() {
-                    return is_stopping() || child_proc->stopped.load(std::memory_order_acquire);
-                });
-            }
-            // child crashed or finished on its own, skip graceful shutdown sequence
-            if (child_proc->stopped.load(std::memory_order_acquire)) {
-                return;
-            }
-            SRV_INF("stopping model instance name=%s\n", name.c_str());
-            fprintf(stdin_file, "%s\n", CMD_ROUTER_TO_CHILD_EXIT);
-            fflush(stdin_file);
-            int64_t start_time = ggml_time_ms();
-            while (true) {
-                std::unique_lock<std::mutex> lk(this->mutex);
-                if (!is_stopping() || child_proc->stopped.load(std::memory_order_acquire)) {
-                    return;
-                }
-                int64_t elapsed = ggml_time_ms() - start_time;
-                if (elapsed >= stop_timeout * 1000) {
-                    lk.unlock();
-                    SRV_WRN("force-killing model instance name=%s after %d seconds timeout\n", name.c_str(), stop_timeout);
-                    child_proc->terminate();
-                    return;
-                }
-                this->cv_stop.wait_for(lk, std::chrono::seconds(1), [&]() {
-                    return !is_stopping() || child_proc->stopped.load(std::memory_order_acquire);
-                });
-            }
-        });
-
-        // we reach here when the child process exits (stdout EOF)
-        // note: we cannot join() prior to this point because it will close stdin_file
-        if (log_thread.joinable()) {
-            log_thread.join();
-        }
-
-        child_proc->stopped.store(true, std::memory_order_release);
-        {
-            // do not erase stopping_models here: the erase must happen under the
-            // same lock as the UNLOADED transition (in update_status), so no
-            // request can observe a dead child that is neither stopping nor
-            // unloaded (#29217)
-            std::lock_guard<std::mutex> lk(this->mutex);
-            cv_stop.notify_all();
-        }
-        if (stopping_thread.joinable()) {
-            stopping_thread.join();
-        }
-
-        // get the exit code
-        int exit_code = child_proc->sproc.join();
-
-        // update status and exit code
-        if (child_mode == SERVER_CHILD_MODE_DOWNLOAD) {
-            // no update_status() here, so clear the stopping mark ourselves or it
-            // can outlive the child and block future instances of the same name (#29217)
-            std::lock_guard<std::mutex> lk(this->mutex);
-            stopping_models.erase(name);
-            cv.notify_all();
-        } else {
-            this->update_status(name, {
-                SERVER_MODEL_STATUS_UNLOADED,
-                exit_code
-            });
-        }
-        SRV_INF("instance name=%s exited with status %d\n", name.c_str(), exit_code);
-    });
-
-    // clean up old process/thread if exists    {
+    // old process should have exited already, but just in case, we clean it up here
+    {
         auto it = mapping.find(name);
         if (it != mapping.end() && it->second.subproc && it->second.subproc->is_alive()) {
             SRV_WRN("old process for model name=%s is still alive, this is unexpected\n", name.c_str());
@@ -1579,18 +1466,11 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
         std::unique_lock<std::mutex> lk(mutex);
         auto it = mapping.find(name);
         if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_UNLOADED) {
-            // route every load through the queue (#29217): the queue entry protects
-            // the model from eviction until its waiters leave. the load itself is
-            // done by the head waiter via try_claim below.
+            // the queue entry protects the model from eviction until its waiters leave
             sched->join(lk, name);
+            sched->tick(lk);
             queued = true;
-            if (!sched->has_capacity(lk)) {
-                // an idle model may sit here right now, do not wait for a request to end
-                victim = sched->pick_victim(lk, name);
-                if (!victim.empty()) {
-                    sched->mark_slot_pending(lk, name);
-                }
-            }        }
+        }
     }
 
     // while queued, this is also where the load happens: the head of the queue does it
@@ -1611,9 +1491,10 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
                 break; // removed by another code path, nothing to wait for
             }
             if (stopping_models.count(name)) {
-                // a stopping instance takes no new request, the next instance serves it (#29217)
+                // a stopping instance takes no new request, the next instance serves it
                 if (!queued) {
                     sched->join(lk, name);
+                    sched->tick(lk);
                     queued = true;
                 }
                 if (should_stop && should_stop()) {
