@@ -1721,15 +1721,21 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     // Carry the DSpark output-layout choice with this model load. A process-wide
     // environment variable can be overwritten while another model is loading.
     static constexpr const char * tensor_mirror_output_key = "mxxm.tensor_mirror_output";
-    const bool tensor_mirror_output =
+    // DSpark needs the mirrored output for its own reasons; MTP needs it so the
+    // backend sampler can run under -sm tensor (see llama_context::set_sampler).
+    const bool has_dspark =
         std::find(params.speculative.types.begin(), params.speculative.types.end(),
                   COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
+    const bool has_mtp =
+        std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                  COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool tensor_mirror_output = has_dspark || has_mtp;
 
     // Target-side repacking changes the verification rounding enough to lower
     // DSpark acceptance on gfx906. The draft already loads without extra buffer
     // types, so keep the target unrepacked too unless explicitly requested.
     const char * dspark_target_repack = std::getenv("LLAMA_DSPARK_TARGET_REPACK");
-    if (tensor_mirror_output && (dspark_target_repack == nullptr || std::atoi(dspark_target_repack) == 0)) {
+    if (has_dspark && (dspark_target_repack == nullptr || std::atoi(dspark_target_repack) == 0)) {
         mparams.use_extra_bufts = false;
     }
 
