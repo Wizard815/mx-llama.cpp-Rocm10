@@ -1027,6 +1027,9 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+    // with prompt fair share, the slot that gets first claim on the next batch
+    size_t prompt_rr = 0;
+
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
@@ -3511,7 +3514,21 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            // slots are visited in order and the first one with a pending prompt fills
+            // the batch. without fair share that is always the lowest slot id, so a long
+            // prompt there starves every slot after it. with fair share the visit order
+            // rotates: each batch starts just past the slot that led the previous one,
+            // so long prompts take turns a whole batch at a time. a batch keeps one
+            // prompt where it can, which is cheaper than mixing prompts in every batch.
+            std::vector<server_slot *> order;
+            order.reserve(slots.size());
+            const size_t rr = params_base.prompt_fair_share ? prompt_rr % slots.size() : 0;
+            for (size_t i = 0; i < slots.size(); i++) {
+                order.push_back(&slots[(rr + i) % slots.size()]);
+            }
+            int lead_prompt_id = -1; // first slot that added prompt tokens to this batch
+
+            iterate(order, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
@@ -4050,6 +4067,10 @@ private:
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
 
+                    if (lead_prompt_id < 0 && n_tokens_cur > 0) {
+                        lead_prompt_id = slot.id;
+                    }
+
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
@@ -4124,6 +4145,11 @@ private:
                     slot_batched = &slot;
                 }
             });
+
+            // the next batch starts with the slot after this batch's lead prompt
+            if (params_base.prompt_fair_share && lead_prompt_id >= 0) {
+                prompt_rr = (size_t) lead_prompt_id + 1;
+            }
         }
     }
 

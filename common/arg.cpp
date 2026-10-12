@@ -2581,6 +2581,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
     add_opt(common_arg(
+        {"--prompt-fair-share"},
+        {"--no-prompt-fair-share"},
+        string_format("take turns between slots that are processing prompts, one batch each, so a long prompt in a low slot cannot starve the others (default: %s)", params.prompt_fair_share ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.prompt_fair_share = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_FAIR_SHARE"));
+    add_opt(common_arg(
         {"-mm", "--mmproj"}, "FILE",
         "path to a multimodal projector file. see tools/mtmd/README.md\n"
         "note: if -hf is used, this argument can be omitted",
