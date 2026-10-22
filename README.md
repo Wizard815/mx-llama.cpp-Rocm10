@@ -18,7 +18,7 @@
 | **Custom GPU AllReduce** | peer-write, beats the RCCL ring for generation over PCIe |
 | **Weight repack** | GPU-side weight layout for gfx906, on by default, all split modes: Q8_0, MXFP4, IQ4_NL, Q4_K, Q5_K, Q6_K and Q5_1. Q8_0 path by [iacopPBK](https://github.com/iacopPBK) |
 
-[FEATURES.md](FEATURES.md) - flags, measurements, scope. Base: upstream `b10760`.
+[FEATURES.md](FEATURES.md) - flags, measurements, scope. Base: upstream `b11553`.
 
 ---
 # llama.cpp
@@ -43,6 +43,14 @@
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
+
+```bash
+# curl
+curl -LsSf https://llama.app/install.sh | sh
+
+# powershell
+irm https://llama.app/install.ps1 | iex
+```
 
 - Visit https://llama.app and follow the instructions
 - Run with Docker - see our [Docker documentation](docs/docker.md)

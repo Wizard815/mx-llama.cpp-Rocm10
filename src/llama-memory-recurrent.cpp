@@ -146,6 +146,13 @@ llama_memory_recurrent::llama_memory_recurrent(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    if (is_empty()) {
+        if (n_rs_seq > 0) {
+            n_rs_seq = 0;
+            LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
+        }
+    }
+
     if (ring_enabled && !ctxs_bufs.empty()) {
         LLAMA_LOG_INFO("%s: snapshot ring enabled, planes = %u\n", __func__, n_planes());
     }
@@ -217,6 +224,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                // a cell shared by several sequences cannot move back for only one of them
+                if (cell.seq_id.size() > 1) {
+                    return false;
+                }
                 const bool invalid_ring = ring_enabled && !ring_valid[seq_id];
 
                 // A failed ring transaction deliberately invalidates this sequence.
@@ -896,6 +907,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 bool llama_memory_recurrent::get_can_shift() const {
     // shifting the pos is trivial for recurrent models
     return true;
+}
+
+bool llama_memory_recurrent::is_empty() const {
+    const bool res = ctxs_bufs.empty();
+    assert(!res || total_size() == 0);
+    return res;
 }
 
 size_t llama_memory_recurrent::total_size() const {

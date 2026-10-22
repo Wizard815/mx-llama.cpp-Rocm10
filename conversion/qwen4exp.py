@@ -25,49 +25,34 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # Qwen ships a 4B MTP draft head in this checkpoint: 31 mtp.* tensors forming a
-    # full MoE block with its own hyper-connections. Upstream drops it because vLLM
-    # does. The Qwen base class already knows how to place an MTP block, so exporting
-    # it costs only the two tensors below that its remapper does not cover.
+    # the MTP head: one full-attention QSA block after the trunk, fed by the trunk's hc-wide residual
     supports_mtp_export = True
-    no_mtp = False
+
+    # MTP tensors the shared Qwen remapper does not know
+    _MTP_EXTRA = {
+        "fc_embedding":           "nextn_fc_embedding",
+        "fc_hidden":              "nextn_fc_hidden",
+        "hyper_connection_mixer": "nextn_hc_head",
+    }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # only the shard names, so the table itself is never held
         self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
+        self._mtp_fc: dict[str, Tensor] = {}
 
     @classmethod
     def filter_tensors(cls, item):
         name, gen = item
-        if name.startswith("mtp.") and not cls.no_mtp:
-            tail = {
-                "mtp.fc_embedding.weight":                                 "eh_proj.weight",
-                "mtp.fc_hidden.weight":                                    "fc_hidden.weight",
-                "mtp.hyper_connection_mixer.hc_norm.weight":               "nextn_hc_norm.weight",
-                "mtp.hyper_connection_mixer.input_mix_weight_down.weight": "nextn_hc_down.weight",
-                "mtp.hyper_connection_mixer.input_mix_weight_up.weight":   "nextn_hc_up.weight",
-            }.get(name)
-            if tail is not None:
-                assert cls._original_block_count is not None
-                # return directly: the base drops anything that is neither mtp.* nor
-                # in its keep-list when mtp_only is set, and the rename below has
-                # already stripped the prefix it would match on
-                return "model.layers.%d.%s" % (cls._original_block_count, tail), gen
-
-        # A head-only export must also carry the TRUNK's final mixer. The head has no
-        # output norm of its own - fc_hidden takes n_embd while hnorm is hc_dim, so the
-        # head's own mixer is spent folding its input - and the base keep-list names
-        # model.norm.weight, which this arch does not have. Same intent, different
-        # tensor: here the final norm IS hyper_connection_mixer.
-        if cls.mtp_only and ".hyper_connection_mixer." in name and not name.startswith("mtp."):
-            # return directly with the language_model prefix stripped: routing through
-            # the base would hit its mtp_only keep-list, which names model.norm.weight
-            # and so drops this
-            return name.replace("language_model.", ""), gen
-
-        return super().filter_tensors((name, gen))
+        part = name.split(".")[1] if name.startswith("mtp.") else None
+        if part in cls._MTP_EXTRA:
+            if cls.no_mtp:
+                return None
+            assert cls._original_block_count is not None
+            rest = name.split(".", 2)[2]
+            return f"model.layers.{cls._original_block_count}.{cls._MTP_EXTRA[part]}.{rest}", gen
+        return super().filter_tensors(item)
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -97,24 +82,17 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
-        # per-layer arrays are indexed by block, so they must span the MTP block too -
-        # the loader rejects a length that does not match block_count. The head's own
-        # layer_types live under the mtp config section.
-        types = list(layer_types[:n_layer])
-        if self.block_count > n_layer:
-            mtp_types = (hp.get("mtp") or {}).get("layer_types") or ["full_attention"]
-            types += [mtp_types[i % len(mtp_types)] for i in range(self.block_count - n_layer)]
+        # the MTP block is a full-attention QSA layer too
         self.gguf_writer.add_attention_compress_ratios(
-            [ratio if t == "full_attention" else 0 for t in types]
+            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+            + [ratio] * (self.block_count - n_layer)
         )
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
         # so emit no PLE keys rather than optional ones
+        # the MTP head never reads PLE, so an MTP-only file carries none of it
         ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
-        if not ple_layers:
-            return
-        if self.mtp_only:
-            # no n-gram table in a head-only export
+        if not ple_layers or self.mtp_only:
             return
         self.gguf_writer.add_ple_layers(ple_layers)
         self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
@@ -129,17 +107,12 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if self._ple_row_dim is not None:
             self.gguf_writer.add_embedding_length_per_layer_input(self._ple_row_dim)
 
-        # An MTP-only export carries the draft head alone. The head is a plain
-        # attention plus MoE block and never reads the n-gram table, so the PLE hash
-        # constants are absent from that checkpoint by design - requiring them here
-        # would refuse a perfectly valid export.
-        if not self.mtp_only:
-            self.gguf_writer.add_ple_layer_multipliers(
-                self._read_hash_constants("ple_embedding.layer_multipliers"))
-            self.gguf_writer.add_ple_head_offsets(
-                self._read_hash_constants("ple_embedding.ngram_heads_offsets"))
-            self.gguf_writer.add_ple_head_vocab_sizes(
-                self._read_hash_constants("ple_embedding.ngram_heads_vocab_sizes"))
+        self.gguf_writer.add_ple_layer_multipliers(
+            self._read_hash_constants("ple_embedding.layer_multipliers"))
+        self.gguf_writer.add_ple_head_offsets(
+            self._read_hash_constants("ple_embedding.ngram_heads_offsets"))
+        self.gguf_writer.add_ple_head_vocab_sizes(
+            self._read_hash_constants("ple_embedding.ngram_heads_vocab_sizes"))
 
     def _image_token_id(self) -> int | None:
         img = self.hparams.get("image_token_id")
@@ -168,6 +141,14 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
         if ".ngram_embedding.shard_" in name:
             return self._place_ple_shard(data_torch, name)
+
+        # eh_proj([e ; h_s]) = fc_embedding(e) + fc_hidden(h_s) for every hc stream s
+        if name.endswith((".nextn_fc_embedding.weight", ".nextn_fc_hidden.weight")):
+            self._mtp_fc[name.rsplit(".", 2)[1]] = data_torch
+            if len(self._mtp_fc) < 2:
+                return []
+            eh = torch.cat([self._mtp_fc.pop("nextn_fc_embedding"), self._mtp_fc.pop("nextn_fc_hidden")], dim=1)
+            return [(self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ, bid, ".weight"), eh)]
 
         # one projection feeds indexer q and k; split it, as minimax-m3 does
         if ".indexer.index_qk_proj.weight" in name:
@@ -231,6 +212,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     def prepare_tensors(self):
         super().prepare_tensors()
+        if self._mtp_fc:
+            raise ValueError(f"MTP projection missing its other half: {sorted(self._mtp_fc)}")
         n_parts = self.hparams.get("split_ngram_parts", 0)
         if self._ple_shards and len(self._ple_shards) != n_parts:
             raise ValueError(

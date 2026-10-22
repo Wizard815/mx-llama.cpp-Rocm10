@@ -83,6 +83,7 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
     if (!dsv4_ubatch_has_coupled(ubatch)) {
         return ubatch;
     }
+    ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.embd) {
         throw std::runtime_error("DSV4 coupled embedding ubatches are not supported");
     }
@@ -158,12 +159,15 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
         /*.n_pos        =*/ ubatch.n_pos,
         /*.token        =*/ data->token.empty() ? nullptr : data->token.data(),
         /*.embd         =*/ nullptr,
+        /*.embd_state   =*/ nullptr,
         /*.pos          =*/ data->pos.data(),
         /*.n_seq_id     =*/ data->n_seq_id.data(),
         /*.seq_id       =*/ data->seq_id.data(),
         /*.seq_id_unq   =*/ data->seq_id_unq.data(),
         /*.seq_idx      =*/ data->seq_idx.data(),
         /*.output       =*/ data->output.data(),
+        /*.type         =*/ nullptr,
+        /*.decision_order =*/ nullptr,
         /*.data         =*/ data,
     };
 
@@ -1560,12 +1564,6 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_update(llama_context * lctx, 
 bool llama_kv_cache_dsv4::get_can_shift() const {
     // Compressed row metadata uses block-derived positions. Keep shifting
     // disabled until DSV4 compressed-cache shift semantics are wired.
-    return false;
-}
-
-bool llama_kv_cache_dsv4::get_can_checkpoint() const {
-    // The compressed attention state cannot currently be restored losslessly
-    // from a partial sequence checkpoint.
     return false;
 }
 

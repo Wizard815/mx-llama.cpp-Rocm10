@@ -397,7 +397,7 @@ gated-delta-net warp counts.
 
 ## BF16 compute on AMD without native bfloat16
 
-On AMD parts predating CDNA and RDNA3, BF16 matmuls compute in F32. rocBLAS has
+On AMD parts predating CDNA and RDNA3, BF16 matmuls over more than 32 columns compute in F32. rocBLAS has
 no tuned bf16 kernel for that hardware, and `compute_type=BF16` also rounds the
 F32 activations down to bf16, so F32 is both faster and more faithful. Automatic,
 no flag. Worth +18-19% prefill on UD / `*_XL` quants that keep BF16 tensors.
@@ -420,7 +420,7 @@ path was contributed by DENEB1312; MXFP4, the K-quant types and the legacy
 Q5_1 follow it through per-type kernel traits. On by default on gfx906,
 carried by the extra buffer types like upstream's CPU weight repack, so
 `--no-repack` disables it
-(`-nr 1` in llama-bench); a draft model always loads canonical weights. Model
+(`--repack 0` or `-nr 1` in llama-bench); a draft model always loads canonical weights. Model
 load stages canonical bytes and repacks on the device, so `-sm layer` loads
 at vanilla-loader parity and tensor-parallel loads within about 1.4x of it.
 Every type is admitted under `-sm tensor` and multi-stage `-tps`, where each

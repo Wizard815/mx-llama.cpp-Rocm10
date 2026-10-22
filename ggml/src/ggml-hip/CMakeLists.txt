@@ -12,7 +12,7 @@ list(APPEND CMAKE_PREFIX_PATH  ${ROCM_PATH})
 list(APPEND CMAKE_PREFIX_PATH "${ROCM_PATH}/lib64/cmake")
 
 if (NOT DEFINED CMAKE_HIP_FLAGS_DEBUG)
-    set(CMAKE_HIP_FLAGS_DEBUG "-g -O2")
+    set(CMAKE_HIP_FLAGS_DEBUG "-g -Xarch_device -O2 -Xarch_host -O0")
 endif()
 
 # Ensure position-independent code for all HIP compilations (bug fix ported from
@@ -83,20 +83,9 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
 ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
-# TurboQuant FA template instances (always compiled, regardless of GGML_CUDA_FA_ALL_QUANTS).
-# Guarded by "if (NOT GGML_CUDA_FA_ALL_QUANTS)" to avoid appending (and double-compiling)
-# these same files twice: when GGML_CUDA_FA_ALL_QUANTS is ON the blanket
-# "template-instances/fattn-vec*.cu" glob above already picks them up.
-if (NOT GGML_CUDA_FA_ALL_QUANTS)
-    file(GLOB SRCS "../ggml-cuda/template-instances/fattn-vec*turbo2*.cu")
-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
-    file(GLOB SRCS "../ggml-cuda/template-instances/fattn-vec*turbo3*.cu")
-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
-    file(GLOB SRCS "../ggml-cuda/template-instances/fattn-vec*turbo4*.cu")
-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
-    file(GLOB SRCS "../ggml-cuda/template-instances/fattn-vec*f16-q8_0*.cu")
-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
-endif()
+# TurboQuant FA vec instances: turbo types are not in ggml_cuda_fattn_vec_instances' FA_TYPES, so always add them.
+file(GLOB SRCS "../ggml-cuda/template-instances/fattn-vec*turbo*.cu")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
