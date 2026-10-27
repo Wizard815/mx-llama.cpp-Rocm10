@@ -8,6 +8,8 @@ services:
     build:
       context: .
       dockerfile: gfx906-rocm10.Dockerfile
+      args:
+        BASE_IMAGE: ${GFX906_BASE_IMAGE:-zenth815/mx-llama-rocm10-gfx906:latest}
     image: mx-llama-rocm10-gfx906:local
 
   mx-llamacpp-ssh:
