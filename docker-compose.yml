@@ -26,6 +26,10 @@ services:
     volumes:
       - ${ODYSSEUS_SSH_KEY:?set ODYSSEUS_SSH_KEY in .env}:/run/secrets/authorized_key:ro
       - ${MODELS_DIR:?set MODELS_DIR in .env}:/app/models
+      # Extra client public keys (*.pub), e.g. the Argos launcher's key.
+      - ./ssh/authorized_keys.d:/run/secrets/authorized_keys.d:ro
+      # Persisted sshd host keys, so rebuilds keep the server's identity.
+      - ./ssh/host-keys:/etc/ssh/host-keys
     ports:
       - "2222:22"
       - "8000:8000"
