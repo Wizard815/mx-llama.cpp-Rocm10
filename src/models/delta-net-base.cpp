@@ -467,7 +467,13 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
-    qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
+    // Materialize the transpose before the concat. Concatenating a transposed
+    // view takes the generic non-contiguous concat kernel, whose reads of this
+    // operand stride by a full row (conv_channels elements) per thread, so
+    // almost none coalesce: ~3.6 ms per layer at ubatch 2048 on gfx906. A cont
+    // of the transpose uses the tiled transpose copy instead, and the concat
+    // of two contiguous tensors then takes the contiguous fast path.
+    qkv_mixed = ggml_cont(ctx0, ggml_transpose(ctx0, qkv_mixed));
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
