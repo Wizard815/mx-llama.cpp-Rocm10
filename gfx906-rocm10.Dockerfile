@@ -15,5 +15,12 @@ RUN HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
       -DCMAKE_HIP_FLAGS="-mllvm -amdgpu-sched-strategy=max-ilp" \
       -DLLAMA_BUILD_TESTS=OFF \
     && cmake --build build --config Release -j"$(nproc)" \
+    && rm -f /app/libggml*.so* /app/libllama*.so* /app/libmtmd*.so* \
     && cp build/bin/llama-server build/bin/llama-cli build/bin/llama-bench /app/ \
-    && ls -l /app/llama-server
+    && cp -P build/bin/*.so* /app/ \
+    && ls -l /app/llama-server /app/libggml-hip.so
+
+# The base image ships its own (older) libggml-*.so / libllama*.so in /app,
+# next to the binaries. Copying only the executables let llama-server load
+# the base image's libggml-hip.so against this build's libggml-base.so, so
+# GPU fixes in this tree never ran. The rm above drops every old copy first.
