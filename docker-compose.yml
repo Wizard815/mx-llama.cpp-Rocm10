@@ -10,6 +10,8 @@ services:
       dockerfile: gfx906-rocm10.Dockerfile
       args:
         BASE_IMAGE: ${GFX906_BASE_IMAGE:-zenth815/mx-llama-rocm10-gfx906:latest}
+        AMDGPU_TARGETS: ${GFX906_AMDGPU_TARGETS:-gfx906}
+        HIP_FLAGS: ${GFX906_HIP_FLAGS:--mllvm -amdgpu-sched-strategy=max-ilp}
     image: mx-llama-rocm10-gfx906:local
 
   mx-llamacpp-ssh:

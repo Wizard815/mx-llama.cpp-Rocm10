@@ -5,6 +5,13 @@
 ARG BASE_IMAGE=zenth815/mx-llama-rocm10-gfx906:latest
 FROM ${BASE_IMAGE}
 
+# Tuning knobs, set from .env via docker-compose.yml (GFX906_AMDGPU_TARGETS,
+# GFX906_HIP_FLAGS). gfx906:xnack- builds for the MI50's exact ISA (no XNACK
+# replay constraints); runtime detection uses the device's own ISA name, so
+# either value runs on MI50/MI60.
+ARG AMDGPU_TARGETS=gfx906
+ARG HIP_FLAGS="-mllvm -amdgpu-sched-strategy=max-ilp"
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake ninja-build git libssl-dev libgomp1 curl ca-certificates \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -15,9 +22,9 @@ COPY . .
 RUN HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
     cmake -S . -B build -GNinja \
       -DGGML_HIP=ON -DGGML_HIP_GRAPHS=ON -DGGML_HIP_RCCL=ON \
-      -DAMDGPU_TARGETS=gfx906 -DCMAKE_BUILD_TYPE=Release -DHIP_COMPILER=clang \
+      -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" -DCMAKE_BUILD_TYPE=Release -DHIP_COMPILER=clang \
       -DCMAKE_CXX_FLAGS="-O3 -Wno-unused-command-line-argument" \
-      -DCMAKE_HIP_FLAGS="-mllvm -amdgpu-sched-strategy=max-ilp" \
+      -DCMAKE_HIP_FLAGS="${HIP_FLAGS}" \
       -DLLAMA_BUILD_TESTS=OFF \
     && cmake --build build --config Release -j"$(nproc)" \
     && mkdir -p /app \
