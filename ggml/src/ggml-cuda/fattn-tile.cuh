@@ -312,10 +312,33 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     return 0;
 }
 
+// GCN (gfx900/gfx906: wave64, no matrix cores). Uses the generic AMD table unless
+// fattn-tile-gcn-tune.h defines an override, which is how
+// scripts/gfx906-fattn-tile-sweep.sh tries configs without editing this file.
+// Each override is "nthreads, occupancy, nbatch_fa, nbatch_K" for one (DKQ, DV, ncols).
+#include "fattn-tile-gcn-tune.h"
+#define GGML_CUDA_FATTN_TILE_CONFIG_CASE_EXPAND(...) GGML_CUDA_FATTN_TILE_CONFIG_CASE(__VA_ARGS__)
+
+static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_amd_gcn(const int DKQ, const int DV, const int ncols) {
+#ifdef GGML_FATTN_TILE_GCN_256_32
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE_EXPAND(256, 256, 32, GGML_FATTN_TILE_GCN_256_32)
+#endif
+#ifdef GGML_FATTN_TILE_GCN_256_16
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE_EXPAND(256, 256, 16, GGML_FATTN_TILE_GCN_256_16)
+#endif
+#ifdef GGML_FATTN_TILE_GCN_128_32
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE_EXPAND(128, 128, 32, GGML_FATTN_TILE_GCN_128_32)
+#endif
+    return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
+}
+
 static __host__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols, const int cc) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_RDNA(cc)) {
             return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
+        }
+        if (GGML_CUDA_CC_IS_GCN(cc)) {
+            return ggml_cuda_fattn_tile_get_config_amd_gcn(DKQ, DV, ncols);
         }
         return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
     }
@@ -327,8 +350,10 @@ static __host__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const in
 
 static constexpr __device__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols) {
 #ifdef GGML_USE_HIP
-#ifdef RDNA
+#if defined(RDNA)
     return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
+#elif defined(GCN)
+    return ggml_cuda_fattn_tile_get_config_amd_gcn(DKQ, DV, ncols);
 #else
     return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
 #endif // RDNA
