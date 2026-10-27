@@ -160,3 +160,6 @@ AGENTS.local.md
 .env
 docker-compose.override.yml
 docker-compose.override.yaml
+
+# ssh sidecar: client keys and persisted host keys (local, never committed)
+/ssh/

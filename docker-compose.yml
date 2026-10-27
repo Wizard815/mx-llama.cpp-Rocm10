@@ -8,6 +8,10 @@ services:
     build:
       context: .
       dockerfile: gfx906-rocm10.Dockerfile
+      args:
+        BASE_IMAGE: ${GFX906_BASE_IMAGE:-zenth815/mx-llama-rocm10-gfx906:latest}
+        AMDGPU_TARGETS: ${GFX906_AMDGPU_TARGETS:-gfx906}
+        HIP_FLAGS: ${GFX906_HIP_FLAGS:--mllvm -amdgpu-sched-strategy=max-ilp}
     image: mx-llama-rocm10-gfx906:local
 
   mx-llamacpp-ssh:
@@ -26,6 +30,10 @@ services:
     volumes:
       - ${ODYSSEUS_SSH_KEY:?set ODYSSEUS_SSH_KEY in .env}:/run/secrets/authorized_key:ro
       - ${MODELS_DIR:?set MODELS_DIR in .env}:/app/models
+      # Extra client public keys (*.pub), e.g. the Argos launcher's key.
+      - ./ssh/authorized_keys.d:/run/secrets/authorized_keys.d:ro
+      # Persisted sshd host keys, so rebuilds keep the server's identity.
+      - ./ssh/host-keys:/etc/ssh/host-keys
     ports:
       - "2222:22"
       - "8000:8000"
