@@ -9,6 +9,8 @@
 #include "../unary.cuh"
 #include "repack-common.cuh"
 
+#include <type_traits>
+
 struct repack_tile_meta {
     uint32_t expert;
     uint32_t a_base;
@@ -531,6 +533,7 @@ static __device__ void mmq_gemm_repacked_impl(
     const int ty = threadIdx.y;
     const uint32_t row0 = blockIdx.x * MMQ_RP_Q8_BM;
     constexpr uint32_t BN = CW * TN_;
+    static_assert(BN % 32 == 0 || BN <= 16, "sX_swizzle permutes within 32-column groups");
     uint32_t tok0 = blockIdx.y * BN;
     uint32_t a_base = 0, a_end = 0;
     if constexpr (HAS_IDS) {
@@ -577,13 +580,19 @@ static __device__ void mmq_gemm_repacked_impl(
     constexpr int NROW = MMQ_RP_Q8_BM / NRL;
     float acc[NROW][TN_] = {};
 
+    // Row scales come from LDS SPF at a time: a uint4 of SPW slots, or a narrower
+    // fetch when a thread owns fewer rows (a uint4 would run into the next thread's
+    // rows and past acc[NROW]).
+    constexpr int SPF = NROW < SPW ? NROW : SPW;
+    constexpr int SFB = SPF * (int) sizeof(slot_t);
+    static_assert(NROW % SPF == 0 && (SFB == 16 || SFB == 8 || SFB == 4), "unsupported rows per thread");
+    using sfetch_t = std::conditional_t<SFB == 16, uint4, std::conditional_t<SFB == 8, uint2, uint32_t>>;
+
     constexpr int NTHREADS = CW * NRL;
     constexpr int W_ELM = MMQ_RP_Q8_BM * MMQ_RP_Q8_BK;
     constexpr int X_ELM = BN * MMQ_RP_Q8_BK;
     constexpr int W_EPT = (W_ELM + NTHREADS - 1) / NTHREADS;
     constexpr int X_EPT = (X_ELM + NTHREADS - 1) / NTHREADS;
-
-    const int sxc0 = sX_swizzle<CW>(tx);
 
     uint4    pw_lo[W_EPT];
     uint4    pw_hi[W_EPT];
@@ -769,7 +778,8 @@ static __device__ void mmq_gemm_repacked_impl(
             int   xq32[TN_][8];
 #pragma unroll
             for (int n = 0; n < TN_; n++) {
-                const int xcol = sxc0 + n * CW;
+                // swizzle the whole column: for CW < 32 a thread's columns span swizzle groups
+                const int xcol = sX_swizzle<CW>(tx + n * CW);
                 const uint4 q0 = sXq[xcol].q[kk][0];
                 const uint4 q1 = sXq[xcol].q[kk][1];
                 dx[n] = sXd[xcol][kk];
@@ -788,15 +798,15 @@ static __device__ void mmq_gemm_repacked_impl(
             const int row_base = ty * NROW;
             uint4 wlo = sW_lo[row_base][kk];
             uint4 whi = sW_hi[row_base][kk];
-            const uint4 * dp16 = reinterpret_cast<const uint4 *>(&sWdh[kk][row_base]);
+            const sfetch_t * dpf = reinterpret_cast<const sfetch_t *>(&sWdh[kk][row_base]);
 
 #pragma unroll
-            for (int g = 0; g < NROW; g += SPW) {
-                const uint4 dh4 = dp16[g / SPW];
-                const slot_t * dh = reinterpret_cast<const slot_t *>(&dh4);
+            for (int g = 0; g < NROW; g += SPF) {
+                const sfetch_t dhf = dpf[g / SPF];
+                const slot_t * dh = reinterpret_cast<const slot_t *>(&dhf);
 
 #pragma unroll
-                for (int rr = 0; rr < SPW; rr++) {
+                for (int rr = 0; rr < SPF; rr++) {
                     const int r = g + rr;
 
                     const uint4 wlo_c = wlo, whi_c = whi;
@@ -942,8 +952,9 @@ static __device__ void mmq_gemm_repacked_impl(
 }
 
 // Launch wrapper: 64-wide waves, tuned for large batches (ne11 >= 128).
-// MINB = blocks per CU the register budget must allow (__launch_bounds__); a
-// bigger tile under the same MINB spills instead of losing occupancy.
+// MINB = __launch_bounds__ second argument = amdgpu_waves_per_eu on HIP: minimum
+// waves per SIMD, so the VGPR budget is 256/MINB. A bigger tile under the same
+// MINB spills instead of losing occupancy.
 template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0, int MINB = 2>
 static __global__ void __launch_bounds__(64 * NRL, MINB) mmq_gemm_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
@@ -1230,6 +1241,29 @@ static __global__ void __launch_bounds__(32 * NRL, MINB) mmq_gemm_repacked_w32(
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     mmq_gemm_repacked_impl<WT, HAS_IDS, 32, TN_, NRL>(
+        wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
+        expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
+    NO_DEVICE_CODE;
+#endif
+}
+
+// Launch wrapper with the lane width as a parameter: the tile is CW*TN tokens wide
+// and each thread owns 64/NRL rows x TN tokens. Same tile width, fewer lanes and
+// more tokens per thread means each LDS weight read feeds TN tokens instead of one
+// (the MoE w32 kernel waits on LDS longer than it computes at TN=1).
+template <bool HAS_IDS, int CW, int TN_, int NRL, ggml_type WT, int MINB>
+static __global__ void __launch_bounds__(CW * NRL, MINB) mmq_gemm_repacked_cw(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const uint32_t n_tok,
+        const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
+        const repack_tile_meta * __restrict__ tile_meta,
+        const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    mmq_gemm_repacked_impl<WT, HAS_IDS, CW, TN_, NRL>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
 #else

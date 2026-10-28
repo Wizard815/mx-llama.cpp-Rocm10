@@ -3,15 +3,20 @@
 // Q8_0 repacked GEMM tile config on gfx906 (prefill), see mul-mat.cu (dense, >= 128
 // tokens) and mul-mat-id.cu (MoE, 32-wide path). TN = columns per thread (the tile
 // is CW*TN tokens wide), NRL = row lanes per block (each thread owns 64/NRL rows;
-// must leave 64/NRL a multiple of 4), MINB = blocks per CU the kernel's register
-// budget must allow (lower lets a bigger tile keep its registers instead of
-// spilling). Defaults are the previous hard-wired values;
+// must leave 64/NRL a multiple of 4), MINB = __launch_bounds__ second argument, which
+// HIP turns into amdgpu_waves_per_eu: minimum waves per SIMD, so the VGPR budget is
+// 256/MINB (2 -> 128, 3 -> 84). Defaults are the previous hard-wired values;
 // scripts/gfx906-q8-gemm-sweep.sh overrides them per candidate.
 #ifndef GGML_RP_Q8_DENSE_TN
 #define GGML_RP_Q8_DENSE_TN   MMQ_RP_Q8_TN          // 2
 #endif
 #ifndef GGML_RP_Q8_DENSE_NRL
 #define GGML_RP_Q8_DENSE_NRL  MMQ_RP_Q8_NROW_LANES  // 4
+#endif
+// MoE lane width: the tile is CW*TN tokens and a thread owns 64/NRL rows x TN tokens,
+// so CW 16 / TN 2 keeps the 32-token tile while each LDS weight read feeds 2 tokens.
+#ifndef GGML_RP_Q8_MOE_W32_CW
+#define GGML_RP_Q8_MOE_W32_CW  32
 #endif
 #ifndef GGML_RP_Q8_MOE_W32_TN
 #define GGML_RP_Q8_MOE_W32_TN  1
