@@ -8,7 +8,6 @@
 #include "../mmq.cuh"
 #include "../mmid.cuh"
 
-#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -20,65 +19,22 @@
 // call, skipped while a graph is being captured: set GGML_CUDA_DISABLE_GRAPHS=1) and
 // prints a summary at exit. Diagnostic only.
 static std::atomic<uint64_t> g_tile_calls{0}, g_tile_assign{0}, g_tile_slots{0}, g_tile_tail_hist[5];
-static int g_tile_bn = 0, g_tile_bnt = 0;
+static int g_tile_bn = 0;
 
 static void repack_tile_stats_dump() {
     const uint64_t a = g_tile_assign.load(), sl = g_tile_slots.load();
     if (sl == 0) {
         return;
     }
-    fprintf(stderr, "[repack-moe-tiles] BN=%d tail BN=%d calls=%llu assignments=%llu tile slots=%llu fill=%.1f%%\n",
-        g_tile_bn, g_tile_bnt, (unsigned long long) g_tile_calls.load(), (unsigned long long) a, (unsigned long long) sl, 100.0 * a / sl);
+    fprintf(stderr, "[repack-moe-tiles] BN=%d calls=%llu assignments=%llu tile slots=%llu fill=%.1f%%\n",
+        g_tile_bn, (unsigned long long) g_tile_calls.load(), (unsigned long long) a, (unsigned long long) sl, 100.0 * a / sl);
     fprintf(stderr, "[repack-moe-tiles] expert tails (tokens in the last tile, BN quarters): none=%llu <=1/4=%llu <=1/2=%llu <=3/4=%llu more=%llu\n",
         (unsigned long long) g_tile_tail_hist[0].load(), (unsigned long long) g_tile_tail_hist[1].load(),
         (unsigned long long) g_tile_tail_hist[2].load(), (unsigned long long) g_tile_tail_hist[3].load(),
         (unsigned long long) g_tile_tail_hist[4].load());
 }
 
-// Q8_0 MoE GEMM with tail tiles: full main tiles (the tuned CW/TN/NRL) in one launch,
-// each expert's remainder in BNT = CW_T*TN_T wide tiles in a second. Both write
-// disjoint destination rows (one per assignment).
-template <int CW_T, int TN_T, int NRL_T>
-static void repack_moe_q8_split(ggml_backend_cuda_context & ctx, const uint8_t * w, const block_q8_1 * xq,
-        float * dst_d, int64_t ne00, int64_t ne01, int64_t n_cols, int64_t n_assign,
-        const int32_t * ids_src1, const int32_t * ids_dst, const int32_t * expert_bounds,
-        int64_t ne02, size_t expert_stride, uint32_t dst_s1, cudaStream_t stream) {
-    constexpr int cw  = GGML_RP_Q8_MOE_W32_CW;
-    constexpr int tn  = GGML_RP_Q8_MOE_W32_TN;
-    constexpr int nrl = GGML_RP_Q8_MOE_W32_NRL;
-    constexpr int bn  = cw * tn;
-    constexpr int bnt = CW_T * TN_T;
-
-    const int64_t max_main = std::max<int64_t>(n_assign / bn, 1);
-    const int64_t max_tail = std::max<int64_t>(std::min<int64_t>(n_assign, ne02 * ((bn - 1 + bnt - 1) / bnt)), 1);
-    ggml_cuda_pool_alloc<int32_t>          main_off (ctx.pool(), ne02 + 1);
-    ggml_cuda_pool_alloc<repack_tile_meta> main_meta(ctx.pool(), max_main);
-    ggml_cuda_pool_alloc<int32_t>          tail_off (ctx.pool(), ne02 + 1);
-    ggml_cuda_pool_alloc<repack_tile_meta> tail_meta(ctx.pool(), max_tail);
-    repack_tile_off_split<bn, bnt><<<1, 1, 0, stream>>>(expert_bounds,
-        main_off.get(), main_meta.get(), tail_off.get(), tail_meta.get(), (int) ne02);
-
-    const uint32_t gx = (ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM;
-    mmq_gemm_repacked_cw<true, cw, tn, nrl, GGML_TYPE_Q8_0, GGML_RP_Q8_MOE_W32_MINB><<<dim3(gx, max_main, 1), dim3(cw, nrl), 0, stream>>>(
-        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
-        ids_src1, ids_dst, expert_bounds, main_off.get(), main_meta.get(),
-        (uint32_t) ne02, expert_stride, dst_s1);
-    mmq_gemm_repacked_cw<true, CW_T, TN_T, NRL_T, GGML_TYPE_Q8_0, 2><<<dim3(gx, max_tail, 1), dim3(CW_T, NRL_T), 0, stream>>>(
-        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
-        ids_src1, ids_dst, expert_bounds, tail_off.get(), tail_meta.get(),
-        (uint32_t) ne02, expert_stride, dst_s1);
-}
-
-static int repack_moe_tail_bn() {
-    static const int bn = [] {
-        const char * env = getenv("GGML_CUDA_REPACK_MOE_TAIL");
-        const int v = env != nullptr ? atoi(env) : GGML_RP_Q8_MOE_TAIL_BN;
-        return v == 8 || v == 16 ? v : 0;
-    }();
-    return bn;
-}
-
-static void repack_tile_stats(const int32_t * expert_bounds_d, int64_t n_expert, int bn, int bnt, cudaStream_t stream) {
+static void repack_tile_stats(const int32_t * expert_bounds_d, int64_t n_expert, int bn, cudaStream_t stream) {
 #if defined(GGML_USE_HIP)
     static const bool enabled = getenv("GGML_CUDA_REPACK_TILE_STATS") != nullptr;
     if (!enabled) {
@@ -92,24 +48,22 @@ static void repack_tile_stats(const int32_t * expert_bounds_d, int64_t n_expert,
     if (!registered.exchange(true)) {
         atexit(repack_tile_stats_dump);
     }
-    g_tile_bn  = bn;
-    g_tile_bnt = bnt;
+    g_tile_bn = bn;
     std::vector<int32_t> eb(n_expert + 1);
     CUDA_CHECK(cudaMemcpyAsync(eb.data(), expert_bounds_d, eb.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     uint64_t slots = 0;
     for (int64_t e = 0; e < n_expert; e++) {
-        const int cnt  = eb[e + 1] - eb[e];
+        const int cnt = eb[e + 1] - eb[e];
+        slots += (uint64_t) ((cnt + bn - 1) / bn) * bn;
         const int tail = cnt % bn;
-        slots += bnt == 0 ? (uint64_t) ((cnt + bn - 1) / bn) * bn
-                          : (uint64_t) (cnt / bn) * bn + (uint64_t) ((tail + bnt - 1) / bnt) * bnt;
         g_tile_tail_hist[cnt == 0 || tail == 0 ? 0 : 1 + (4 * tail - 1) / bn]++;
     }
     g_tile_calls++;
     g_tile_assign += (uint64_t) (eb[n_expert] - eb[0]);
     g_tile_slots  += slots;
 #else
-    GGML_UNUSED_VARS(expert_bounds_d, n_expert, bn, bnt, stream);
+    GGML_UNUSED_VARS(expert_bounds_d, n_expert, bn, stream);
 #endif
 }
 
@@ -331,18 +285,6 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                 constexpr int tn_q8  = GGML_RP_Q8_MOE_W32_TN;
                 constexpr int nrl_q8 = GGML_RP_Q8_MOE_W32_NRL;
                 constexpr int bn_q8  = cw_q8 * tn_q8;
-                const int tail_bn = repack_moe_tail_bn();
-                if (tail_bn != 0 && tail_bn < bn_q8) {
-                    if (tail_bn == 16) {
-                        repack_moe_q8_split<8, 2, 8>(ctx, w, xq, dst_d, ne00, ne01, n_cols, n_assign,
-                            ids_src1.get(), ids_dst.get(), expert_bounds.get(), ne02, expert_stride, dst_s1, stream);
-                    } else {
-                        repack_moe_q8_split<8, 1, 8>(ctx, w, xq, dst_d, ne00, ne01, n_cols, n_assign,
-                            ids_src1.get(), ids_dst.get(), expert_bounds.get(), ne02, expert_stride, dst_s1, stream);
-                    }
-                    repack_tile_stats(expert_bounds.get(), ne02, bn_q8, tail_bn, stream);
-                    break;
-                }
                 const int64_t max_tiles_q8 = n_assign / bn_q8 + ne02;
                 ggml_cuda_pool_alloc<int32_t>          tile_off_q8 (ctx.pool(), ne02 + 1);
                 ggml_cuda_pool_alloc<repack_tile_meta> tile_meta_q8(ctx.pool(), max_tiles_q8);
@@ -352,7 +294,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
                     ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_q8.get(), tile_meta_q8.get(),
                     (uint32_t) ne02, expert_stride, dst_s1);
-                repack_tile_stats(expert_bounds.get(), ne02, bn_q8, 0, stream);
+                repack_tile_stats(expert_bounds.get(), ne02, bn_q8, stream);
             } else if (use_w32) {
                 const int64_t max_tiles_w32 = n_assign / BN_W32 + ne02;
                 ggml_cuda_pool_alloc<int32_t>          tile_off_w32 (ctx.pool(), ne02 + 1);
