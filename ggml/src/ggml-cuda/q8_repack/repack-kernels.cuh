@@ -518,13 +518,7 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
 #endif
 }
 
-// GROUPED (MoE only): a 1D grid of n_tiles * row_blocks, ordered expert by expert and,
-// within an expert, row block by row block over that expert's tiles. Tiles of one
-// expert share its weights and the row blocks of one tile share its activations, so
-// both re-reads land close together in time and come from L2. The default 2D grid
-// (row block fastest, then tile) re-reads an expert's weights from HBM for each of
-// its tiles: the MoE GEMM moves ~800 GB/s, so those re-reads are its cost.
-template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL, bool GROUPED = false>
+template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL>
 static __device__ void mmq_gemm_repacked_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -537,35 +531,16 @@ static __device__ void mmq_gemm_repacked_impl(
     const int t  = threadIdx.x + threadIdx.y * blockDim.x;
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
-    static_assert(!GROUPED || HAS_IDS, "the grouped order is per expert");
-    uint32_t bx = blockIdx.x;   // row block
-    uint32_t by = blockIdx.y;   // tile
-    if constexpr (GROUPED) {
-        // tile_off[e] is the first tile of expert e, so blocks [tile_off[e] * gx,
-        // tile_off[e + 1] * gx) belong to expert e and L / gx is one of its tiles
-        const uint32_t gx = (ne1 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM;
-        const uint32_t L  = blockIdx.x;
-        const uint32_t t0 = L / gx;
-        if (t0 >= (uint32_t) tile_off[n_expert]) {
-            return;
-        }
-        const uint32_t e   = tile_meta[t0].expert;
-        const uint32_t f   = (uint32_t) tile_off[e];
-        const uint32_t m   = (uint32_t) tile_off[e + 1] - f;
-        const uint32_t loc = L - f * gx;
-        bx = loc / m;
-        by = f + loc % m;
-    }
-    const uint32_t row0 = bx * MMQ_RP_Q8_BM;
+    const uint32_t row0 = blockIdx.x * MMQ_RP_Q8_BM;
     constexpr uint32_t BN = CW * TN_;
     static_assert(BN % 32 == 0 || BN <= 16, "sX_swizzle permutes within 32-column groups");
-    uint32_t tok0 = by * BN;
+    uint32_t tok0 = blockIdx.y * BN;
     uint32_t a_base = 0, a_end = 0;
     if constexpr (HAS_IDS) {
-        if (by >= (uint32_t) tile_off[n_expert]) {
+        if (blockIdx.y >= (uint32_t) tile_off[n_expert]) {
             return;
         }
-        const repack_tile_meta meta = tile_meta[by];
+        const repack_tile_meta meta = tile_meta[blockIdx.y];
         const uint32_t e = meta.expert;
         a_base = meta.a_base;
         a_end  = (uint32_t) expert_bounds[e + 1];
@@ -1278,7 +1253,7 @@ static __global__ void __launch_bounds__(32 * NRL, MINB) mmq_gemm_repacked_w32(
 // and each thread owns 64/NRL rows x TN tokens. Same tile width, fewer lanes and
 // more tokens per thread means each LDS weight read feeds TN tokens instead of one
 // (the MoE w32 kernel waits on LDS longer than it computes at TN=1).
-template <bool HAS_IDS, int CW, int TN_, int NRL, ggml_type WT, int MINB, bool GROUPED = false>
+template <bool HAS_IDS, int CW, int TN_, int NRL, ggml_type WT, int MINB>
 static __global__ void __launch_bounds__(CW * NRL, MINB) mmq_gemm_repacked_cw(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -1288,7 +1263,7 @@ static __global__ void __launch_bounds__(CW * NRL, MINB) mmq_gemm_repacked_cw(
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
-    mmq_gemm_repacked_impl<WT, HAS_IDS, CW, TN_, NRL, GROUPED>(
+    mmq_gemm_repacked_impl<WT, HAS_IDS, CW, TN_, NRL>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
 #else
