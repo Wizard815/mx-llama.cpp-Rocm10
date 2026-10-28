@@ -623,6 +623,28 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
 
+    // KV-only prefill replay, as in qwen35.cpp: store the head's prompt K/V and skip Q/attention/
+    // MoE FFN/output, whose results the replay discards. Without it the replay ran the full
+    // 248k-vocab LM head over every prompt token (n_outputs == 0 means no row selection).
+    if (cparams.mtp_prefill_kv_only && layer.wqkv == nullptr) {
+        ggml_tensor * Kc = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kc = ggml_reshape_3d(ctx0, Kc, n_embd_head, n_head_kv, n_tokens);
+        Kc = build_norm(Kc, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+
+        ggml_tensor * Vc = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vc = ggml_reshape_3d(ctx0, Vc, n_embd_head, n_head_kv, n_tokens);
+
+        Kc = ggml_rope_multi(ctx0, Kc, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+
+        build_attn_store_kv(inp_attn, Kc, Vc, il);
+
+        res->t_h_nextn = inpSA;
+        ggml_build_forward_expand(gf, inpSA);
+        return;
+    }
+
     auto [Qcur_full, Kcur, Vcur] = build_qkv(layer, cur,
             n_embd_head * 2, n_head,
             n_embd_head,     n_head_kv,
