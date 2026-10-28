@@ -112,6 +112,13 @@ LLAMA_API void llama_set_mtp_prefill_kv_only(struct llama_context * ctx, bool va
 // async D2H); returns its base. The companion getter synchronizes and returns the base.
 LLAMA_API float * llama_set_embeddings_pre_norm_accum(struct llama_context * ctx, int32_t n_tokens_cap);
 LLAMA_API float * llama_get_embeddings_pre_norm_accum(struct llama_context * ctx);
+// Pause (false) or resume (true) copying into an already allocated accumulation buffer
+// without freeing it, so the MTP hook can re-arm deferred prefill for every request
+// instead of reallocating (and clearing) the pinned buffer each time.
+LLAMA_API void llama_set_embeddings_pre_norm_accum_active(struct llama_context * ctx, bool active);
+// Rows per sequence in the accumulation buffer: the row of (seq, pos) is seq*stride + pos.
+// Equals the capacity for a single-sequence or unified-KV context; 0 if no buffer is set.
+LLAMA_API int64_t llama_get_embeddings_pre_norm_accum_stride(const struct llama_context * ctx);
 
 // Marks the entries that a joint decision head (clef) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details

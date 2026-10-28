@@ -127,6 +127,8 @@ struct llama_context {
     // buffer for MTP deferred prefill. Returns the buffer base (or nullptr).
     float * set_embeddings_pre_norm_accum(int32_t n_tokens_cap);
     float * get_embeddings_pre_norm_accum(); // synchronizes, then returns the accum base
+    void    set_embeddings_pre_norm_accum_active(bool active);
+    int64_t get_embeddings_pre_norm_accum_stride() const; // rows per sequence, 0 if no buffer
 
     // Enable (n_tokens_cap > 0) or disable (0) a pinned position-indexed accum for the
     // layer-input taps (DFlash/DSpark deferred prompt encode). One region per tap layer
@@ -360,6 +362,8 @@ private:
     float * embd_pre_norm_accum      = nullptr; // base of buf_pre_norm_accum (pinned), or null
     size_t  embd_pre_norm_accum_size = 0;        // capacity in floats
     int64_t embd_pre_norm_accum_ub   = 0;        // ubatch counter for the ring-wrap drain
+    bool    embd_pre_norm_accum_active = false;  // route extraction into the buffer (paused between requests)
+    int64_t embd_pre_norm_accum_stride = 0;      // rows per sequence ([seq][pos] layout)
 
     // Position-indexed pinned accum for the layer-input taps, same mechanism as the
     // pre-norm accum above: extract_layer_inputs also async-copies each single-seq
@@ -441,6 +445,7 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    bool prev_decode_small  = false; // last decode was a small (< 32 token) batch, see decode()
 
     // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {

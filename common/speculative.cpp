@@ -1791,9 +1791,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // per-chunk synchronize, then build the draft KV in one pass after prefill. Removes
     // the MTP prefill PP regression caused by the per-prefill-chunk target sync.
     bool deferred_prefill = false;
-    bool prefilling       = false;
+    bool prefilling       = false;             // accum routing armed (some seq is prefilling)
     bool deferred_prefill_failed = false;
-    float * prefill_accum_base = nullptr;      // pinned position-indexed [n_ctx][n_embd], owned by ctx_tgt
+    float * prefill_accum_base = nullptr;      // pinned [seq][pos][n_embd], owned by ctx_tgt
+    int64_t prefill_accum_stride = 0;          // rows per seq in prefill_accum_base
+    std::vector<bool> seq_prefilling;          // [n_seq] prompt not yet begun for this seq
     struct prefill_chunk {
         std::vector<llama_token>   tok;
         std::vector<llama_pos>     pos;
@@ -1902,12 +1904,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (const char * env = std::getenv("LLAMA_MTP_ADAPTIVE_DISABLE")) {
             adaptive_disable = std::strcmp(env, "0") != 0;
         }
-        // Position-indexed accum assumes a single sequence per request (prompt positions
-        // of different sequences would collide), so gate to n_seq == 1. It also only
-        // handles the single-head, non-shared-KV draft path (qwen35 / qwen35moe): the
-        // chain_heads (multi-head) and is_mem_shared (gemma4) paths keep upstream's native
-        // per-chunk prefill unchanged.
-        deferred_prefill = n_seq == 1 && !is_mem_shared && !chain_heads;
+        // The accum buffer is [seq][pos] (one n_ctx_seq region per slot), so several slots can
+        // stage prompts at once; a unified KV cache (any seq may use all of n_ctx) is checked
+        // below. Only the single-head, non-shared-KV draft path (qwen35 / qwen35moe) is
+        // handled: the chain_heads (multi-head) and is_mem_shared (gemma4) paths keep
+        // upstream's native per-chunk prefill unchanged.
+        deferred_prefill = !is_mem_shared && !chain_heads;
         if (const char * env = std::getenv("LLAMA_MTP_DEFERRED_PREFILL")) {
             deferred_prefill = deferred_prefill && (std::strcmp(env, "0") != 0);
         }
@@ -1917,14 +1919,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // position-indexed host buffer so the whole prompt hidden survives across
             // decode calls without a per-chunk synchronize. The prefill process() calls
             // (before begin()) then only buffer their tokens; begin() replays them into
-            // the draft context in one pass. Single-request scope for now (the buffer is
-            // cleared after the first replay; re-arming per request is a follow-up).
+            // the draft context in one pass. reset() (slot released) re-arms it per request.
             const int32_t n_ctx_tgt = (int32_t) llama_n_ctx(ctx_tgt);
-            prefill_accum_base = llama_set_embeddings_pre_norm_accum(ctx_tgt, n_ctx_tgt);
+            prefill_accum_base   = llama_set_embeddings_pre_norm_accum(ctx_tgt, n_ctx_tgt);
+            prefill_accum_stride = llama_get_embeddings_pre_norm_accum_stride(ctx_tgt);
+            if (prefill_accum_base != nullptr && n_seq > 1 &&
+                    prefill_accum_stride * (int64_t) n_seq > (int64_t) n_ctx_tgt) {
+                // unified KV: per-seq regions would not fit, keep the per-chunk path
+                llama_set_embeddings_pre_norm_accum(ctx_tgt, 0);
+                prefill_accum_base = nullptr;
+            }
             if (prefill_accum_base == nullptr) {
                 deferred_prefill = false; // pinned-buffer allocation failed, use the normal path
             } else {
                 prefilling = true;
+                seq_prefilling.assign(n_seq, true);
             }
         }
     }
@@ -1964,10 +1973,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // sync) and its pre-norm hidden is staged in prefill_accum. Build the draft KV in
         // one pass here, before generation starts, so the draft quality is identical to the
         // per-chunk path.
-        if (deferred_prefill && prefilling) {
-            if (!finish_deferred_prefill()) {
-                deferred_prefill_failed = true;
-                SPC_ERR("%s", "deferred MTP prefill replay failed; disabling MTP drafts\n");
+        if (deferred_prefill && !deferred_prefill_failed && seq_id >= 0 && seq_id < (llama_seq_id) seq_prefilling.size()) {
+            if (!replay_prefill_chunks()) {
+                fail_deferred_prefill();
+            } else {
+                seq_prefilling[seq_id] = false;
+                update_prefill_routing();
             }
         }
 
@@ -2106,7 +2117,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // prefill_accum (filled async during prefill via the context accum buffer). A single
     // synchronize drains those copies, then each buffered prompt chunk is mirrored into
     // ctx_dft exactly as the per-chunk path would have, producing an identical draft KV.
-    bool finish_deferred_prefill() {
+    bool replay_prefill_chunks() {
+        if (prefill_chunks.empty()) {
+            return true;
+        }
+
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
@@ -2123,8 +2138,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_set_mtp_prefill_kv_only(ctx_dft, true);
         }
 
-        bool ok = base != nullptr || prefill_chunks.empty();
-        const size_t hidden_cap = llama_n_ctx(ctx_tgt);
+        bool ok = base != nullptr;
+        const int64_t stride = prefill_accum_stride;
+        // row of (seq, pos) in the [seq][pos] accum buffer, -1 if outside it
+        auto row_of = [&](llama_seq_id seq, llama_pos pos) -> int64_t {
+            if (seq < 0 || seq >= (llama_seq_id) n_seq || pos < 0 || pos >= stride) {
+                return -1;
+            }
+            return (int64_t) seq * stride + pos;
+        };
         std::vector<float> hidden_scratch;
         // process_decode reads only the entry list, so this batch is never rendered
         common_batch chunk_batch(ctx_dft);
@@ -2135,24 +2157,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                bool contiguous = ch.pos[0] >= 0 && (size_t) ch.pos[0] < hidden_cap;
+                const int64_t row0 = row_of(ch.seq[0], ch.pos[0]);
+                bool contiguous = row0 >= 0;
                 for (int32_t i = 1; i < nt; ++i) {
-                    contiguous = contiguous && ch.pos[i] == ch.pos[0] + i &&
-                        (size_t) ch.pos[i] < hidden_cap;
+                    contiguous = contiguous && row_of(ch.seq[i], ch.pos[i]) == row0 + i;
                 }
 
                 const float * h_tgt = nullptr;
                 if (contiguous) {
-                    h_tgt = base + (size_t) ch.pos[0] * n_embd;
+                    h_tgt = base + (size_t) row0 * n_embd;
                 } else {
                     hidden_scratch.resize((size_t) nt * n_embd);
                     for (int32_t i = 0; i < nt; ++i) {
-                        if (ch.pos[i] < 0 || (size_t) ch.pos[i] >= hidden_cap) {
+                        const int64_t row = row_of(ch.seq[i], ch.pos[i]);
+                        if (row < 0) {
                             ok = false;
                             break;
                         }
                         std::memcpy(hidden_scratch.data() + (size_t) i * n_embd,
-                                    base + (size_t) ch.pos[i] * n_embd,
+                                    base + (size_t) row * n_embd,
                                     (size_t) n_embd * sizeof(float));
                     }
                     h_tgt = hidden_scratch.data();
@@ -2176,10 +2199,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         prefill_chunks.clear();
-        llama_set_embeddings_pre_norm_accum(ctx_tgt, 0); // disable and free the pinned buffer
-        prefill_accum_base = nullptr;
-        prefilling = false;
         return ok;
+    }
+
+    // Keep accum routing on only while some slot is still prefilling. Paused (not freed)
+    // otherwise, so re-arming for the next request needs no reallocation.
+    void update_prefill_routing() {
+        const bool any = std::any_of(seq_prefilling.begin(), seq_prefilling.end(), [](bool v) { return v; });
+        if (any != prefilling) {
+            llama_set_embeddings_pre_norm_accum_active(params.ctx_tgt, any);
+            prefilling = any;
+        }
+    }
+
+    void fail_deferred_prefill() {
+        deferred_prefill_failed = true;
+        prefill_chunks.clear();
+        std::fill(seq_prefilling.begin(), seq_prefilling.end(), false);
+        update_prefill_routing();
+        SPC_ERR("%s", "deferred MTP prefill replay failed; disabling MTP drafts\n");
+    }
+
+    // The server calls reset() when a slot is released. Re-arm deferred prefill for that slot
+    // so its next prompt is also staged without the per-chunk synchronize; before this only
+    // the first request after startup got it, and every later prompt paid the pipeline drain.
+    bool reset(llama_seq_id seq_id) override {
+        if (deferred_prefill && !deferred_prefill_failed &&
+                seq_id >= 0 && seq_id < (llama_seq_id) seq_prefilling.size()) {
+            seq_prefilling[seq_id] = true;
+            update_prefill_routing();
+        }
+        return false;
     }
 
     bool process(const common_batch & batch_in) override {
@@ -2195,9 +2245,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // Deferred prefill: buffer the prompt chunk and let the target pre-norm hidden
         // accumulate in the position-indexed accum buffer (set on ctx_tgt). The draft
-        // decodes are replayed once after prefill (finish_deferred_prefill), which removes
+        // decodes are replayed once after prefill (replay_prefill_chunks), which removes
         // the per-prefill-chunk target synchronize that serialized the prefill pipeline.
-        if (deferred_prefill && prefilling) {
+        bool all_prefilling = deferred_prefill && !deferred_prefill_failed && prefilling;
+        for (int k = 0; all_prefilling && k < n_tokens; ++k) {
+            const llama_seq_id seq = batch_in.tokens[k].seq_id;
+            all_prefilling = seq >= 0 && seq < (llama_seq_id) seq_prefilling.size() && seq_prefilling[seq] &&
+                batch_in.tokens[k].seq_ids_extra.empty();
+        }
+        if (all_prefilling) {
             // The replay carries token ids only, an embedding chunk (image) is left out of the draft cache as before.
             if (batch_in.has_embd()) {
                 return true;
@@ -2209,12 +2265,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             ch.seq.resize(n_tokens);
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
-                GGML_ASSERT(t.seq_ids_extra.empty());
                 ch.tok[k] = t.id;
                 ch.pos[k] = t.pos[0];
                 ch.seq[k] = t.seq_id;
             }
             return true;
+        }
+
+        // A batch that is not all-prompt (another slot is generating) takes the normal
+        // path, which synchronizes anyway. Replay the staged chunks first so the draft KV
+        // is still built in position order for the slots that are mid-prompt.
+        if (!prefill_chunks.empty() && !replay_prefill_chunks()) {
+            fail_deferred_prefill();
         }
 
         if (adaptive_disable && all_disabled()) {

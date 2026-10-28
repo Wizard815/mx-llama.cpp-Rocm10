@@ -477,6 +477,7 @@ struct leaf_alloc {
 struct node_alloc {
     struct tensor_alloc dst;
     struct tensor_alloc src[GGML_MAX_SRC];
+    bool output; // the node was a graph output when the layout was planned, so its memory is never reused
 };
 
 // Cached allocation layout for one graph topology. Keyed by a checksum over
@@ -985,6 +986,7 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
+        node_alloc->output = (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
         if (node->view_src || node->data) {
             node_alloc->dst.buffer_id = -1;
             node_alloc->dst.addr = GGML_BUFFER_ADDRESS_INVALID;
@@ -1180,6 +1182,19 @@ static bool ggml_gallocr_graph_fits(
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &node_allocs[i];
+
+        // A node that is an output now but was not when the layout was planned may share its
+        // memory with a later node of the plan, which then overwrites the output before it is
+        // read back. Same-shape graphs can differ only in which nodes are outputs (backend
+        // sampling keeps one chain per sequence and marks only the chains of the ubatch rows).
+        if ((node->flags & GGML_TENSOR_FLAG_OUTPUT) && !node_alloc->output &&
+                !node->data && !node->view_src) {
+            if (trace) {
+                GGML_LOG_INFO("[realloc] node %d %s (%s) is an output the layout did not plan\n",
+                        i, node->name, ggml_op_desc(node));
+            }
+            return false;
+        }
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
             if (trace) {
