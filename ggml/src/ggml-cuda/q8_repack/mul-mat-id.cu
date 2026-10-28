@@ -35,12 +35,11 @@ static void repack_tile_stats_dump() {
 }
 
 // Kernel options for the Q8_0 MoE GEMM (mmq_gemm_repacked_impl OPT): bit 0 = skewed
-// LDS weight tile, bit 1 = unrolled kk loop. GGML_RP_Q8_MOE_OPT, run-time override
-// GGML_CUDA_REPACK_MOE_OPT=0..3.
+// LDS weight tile. GGML_RP_Q8_MOE_OPT, run-time override GGML_CUDA_REPACK_MOE_OPT=0/1.
 static int repack_moe_opt() {
     static const int opt = [] {
         const char * env = getenv("GGML_CUDA_REPACK_MOE_OPT");
-        return (env != nullptr ? atoi(env) : GGML_RP_Q8_MOE_OPT) & 3;
+        return (env != nullptr ? atoi(env) : GGML_RP_Q8_MOE_OPT) & 1;
     }();
     return opt;
 }
@@ -306,11 +305,10 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols, \
                     ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_q8.get(), tile_meta_q8.get(), \
                     (uint32_t) ne02, expert_stride, dst_s1)
-                switch (repack_moe_opt()) {
-                    case 1:  REPACK_MOE_Q8_LAUNCH(1); break;
-                    case 2:  REPACK_MOE_Q8_LAUNCH(2); break;
-                    case 3:  REPACK_MOE_Q8_LAUNCH(3); break;
-                    default: REPACK_MOE_Q8_LAUNCH(0); break;
+                if (repack_moe_opt() != 0) {
+                    REPACK_MOE_Q8_LAUNCH(1);
+                } else {
+                    REPACK_MOE_Q8_LAUNCH(0);
                 }
 #undef REPACK_MOE_Q8_LAUNCH
                 repack_tile_stats(expert_bounds.get(), ne02, bn_q8, stream);

@@ -519,7 +519,7 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
 }
 
 // OPT (bit mask, 0 = the original kernel): bit 0 skews the LDS weight tile per row
-// group, bit 1 unrolls the kk loop. See the comments at each use.
+// group, see sW_lo below.
 template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL, int OPT = 0>
 static __device__ void mmq_gemm_repacked_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
@@ -878,19 +878,11 @@ static __device__ void mmq_gemm_repacked_impl(
             }
         }
     };
-    // The kk loop stays rolled by default (code size for every type); OPT bit 1 unrolls
-    // it so the scheduler can issue the next sub-block's LDS reads under this one's dp4a
-    // (with one wave per SIMD nothing else hides them: 5 lgkmcnt(0) drains per pass).
+    // The kk loop stays rolled: unrolling it (tried on the CW 8 MoE kernel) needs more
+    // than 256 VGPR and spills, 4x slower.
     auto compute_stage = [&]() {
-        if constexpr ((OPT & 2) != 0) {
-#pragma unroll
-            for (int kk = 0; kk < MMQ_RP_Q8_BK; kk++) {
-                compute_kk(kk);
-            }
-        } else {
-            for (int kk = 0; kk < MMQ_RP_Q8_BK; kk++) {
-                compute_kk(kk);
-            }
+        for (int kk = 0; kk < MMQ_RP_Q8_BK; kk++) {
+            compute_kk(kk);
         }
     };
 
