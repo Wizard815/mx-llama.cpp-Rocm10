@@ -4,30 +4,38 @@
 #   MoE    mmq_gemm_repacked_w32<true,TN,NRL,Q8_0>   (expert GEMM, 32-wide path)
 # Together ~30-35% of prefill GPU time for Tiel-Coder-35B-A3B Q8 on 2x MI50.
 #
-# These kernels only run on weights repacked at model load, which test-backend-ops
-# never creates, so this sweep uses the real model: llama-perplexity on a fixed text
-# as the correctness check (must match the first candidate's PPL) and llama-bench
-# for prefill speed.
+# Per candidate:
+#   1. test-backend-ops MUL_MAT_REPACK: the weights go in the repacked buffer type, so
+#      these are the kernels under test; checked against the CPU backend, then timed
+#      at the model's shapes with -ub 1024 (n=1024).
+#   2. with MODEL set: llama-perplexity on a fixed text (must match the first
+#      candidate's PPL) and llama-bench prefill speed on the real model.
 #
 # Candidate = "dense_TN dense_NRL moe_TN moe_NRL moe_w32_factor"
 #   TN  = columns per thread (tile width = 64*TN dense, 32*TN MoE)
 #   NRL = row lanes per block (64/NRL rows per thread; 64/NRL must be a multiple of 4)
 #   factor: MoE uses the 32-wide tile while n_assign < factor*128*n_expert
 #
+#   scripts/gfx906-q8-gemm-sweep.sh                       # kernel stage only
 #   MODEL=/app/models/.../Tiel-Coder-...-noBF16.gguf scripts/gfx906-q8-gemm-sweep.sh
 #   MODEL=... scripts/gfx906-q8-gemm-sweep.sh "2 4 1 8 2" "1 8 1 8 2"
 #
-# Env: MODEL (required), BUILD_DIR (default build), GPUS (default 0,1),
+# Env: MODEL (optional), BUILD_DIR (default build), BACKEND (default ROCm0),
+#      GPUS (default 0,1), SKIP_CHECK=1,
 #      PPL_TOL (relative PPL tolerance vs the first candidate, default 0.001).
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
-: "${MODEL:?set MODEL to the .gguf to benchmark}"
+MODEL=${MODEL:-}
 BUILD_DIR=${BUILD_DIR:-build}
+BACKEND=${BACKEND:-ROCm0}
 GPUS=${GPUS:-0,1}
 PPL_TOL=${PPL_TOL:-0.001}
 TUNE=ggml/src/ggml-cuda/q8_repack/repack-gcn-tune.h
 BIN="$BUILD_DIR/bin"
+TBO="$BIN/test-backend-ops"
+TARGETS=(test-backend-ops)
+[ -n "$MODEL" ] && TARGETS+=(llama-bench llama-perplexity)
 COMMON=(-m "$MODEL" -ngl 99 -sm layer -lm dio)
 
 if [ $# -gt 0 ]; then
@@ -60,7 +68,7 @@ cp "$TUNE" "$backup"
 restore() {
     cp "$backup" "$TUNE"; rm -f "$backup" "$PPL_FILE"
     echo "=== restoring default build"
-    cmake --build "$BUILD_DIR" --target llama-bench llama-perplexity -j"$(nproc)" > /dev/null 2>&1 || echo "    rebuild failed, rebuild $BUILD_DIR manually"
+    cmake --build "$BUILD_DIR" --target "${TARGETS[@]}" -j"$(nproc)" > /dev/null 2>&1 || echo "    rebuild failed, rebuild $BUILD_DIR manually"
 }
 trap restore EXIT
 
@@ -73,9 +81,31 @@ for c in "${CANDIDATES[@]}"; do
     printf '#pragma once\n#define GGML_RP_Q8_DENSE_TN %s\n#define GGML_RP_Q8_DENSE_NRL %s\n#define GGML_RP_Q8_MOE_W32_TN %s\n#define GGML_RP_Q8_MOE_W32_NRL %s\n#define GGML_RP_Q8_MOE_W32_FACTOR %s\n' \
         "$dtn" "$dnrl" "$mtn" "$mnrl" "$fac" > "$TUNE"
 
-    if ! cmake --build "$BUILD_DIR" --target llama-bench llama-perplexity -j"$(nproc)" > /tmp/q8-sweep-build.log 2>&1; then
+    if ! cmake --build "$BUILD_DIR" --target "${TARGETS[@]}" -j"$(nproc)" > /tmp/q8-sweep-build.log 2>&1; then
         echo "    compile failed (see /tmp/q8-sweep-build.log)"
         results+=("$label | compile failed")
+        continue
+    fi
+
+    check="skipped"
+    if [ "${SKIP_CHECK:-0}" != 1 ]; then
+        if out=$("$TBO" -o MUL_MAT_REPACK -b "$BACKEND" 2>&1); then
+            check="ok"
+        else
+            check="FAILED"
+            echo "$out" | grep -E 'FAIL|not supported' | head -5
+        fi
+        echo "    kernel check: $check ($(echo "$out" | grep -Eo '[0-9]+/[0-9]+ tests passed' | tail -1))"
+    fi
+    perf=$("$TBO" perf -o MUL_MAT_REPACK -b "$BACKEND" -p ',n=1024,' 2>&1 | grep -E 'us/run')
+    echo "$perf" | sed -E 's/^ *MUL_MAT_REPACK\(type_a=q8_0,/    /'
+    # dense rows first, then MoE up/gate and down (order of the perf cases)
+    times=$(echo "$perf" | grep -Eo '[0-9.]+ us/run' | awk '{printf "%s ", $1}')
+    total=$(echo "$perf" | grep -Eo '[0-9.]+ us/run' | awk '{s+=$1} END {printf "%.0f", s}')
+    label="$label | check=$check | us/run: $times| sum=$total"
+
+    if [ -z "$MODEL" ]; then
+        results+=("$label")
         continue
     fi
 
@@ -86,14 +116,14 @@ for c in "${CANDIDATES[@]}"; do
         results+=("$label | perplexity failed")
         continue
     fi
-    check="ok"
+    pcheck="ok"
     if [ -z "$ppl_ref" ]; then
         ppl_ref=$ppl
-        check="reference"
+        pcheck="reference"
     elif ! python3 -c "import sys; r,p,t=map(float,sys.argv[1:]); sys.exit(0 if abs(p-r)/r <= t else 1)" "$ppl_ref" "$ppl" "$PPL_TOL"; then
-        check="MISMATCH"
+        pcheck="MISMATCH"
     fi
-    echo "    PPL $ppl ($check)"
+    echo "    PPL $ppl ($pcheck)"
 
     bench=$(HIP_VISIBLE_DEVICES=$GPUS "$BIN/llama-bench" "${COMMON[@]}" -fa 1 -b 2048 -ub 1024 \
             -p 2048,8192 -n 0 -r 3 -o csv 2>/dev/null)
@@ -102,9 +132,9 @@ import csv, sys
 rows = list(csv.DictReader(sys.stdin))
 print(" ".join(f"pp{r[\"n_prompt\"]}={float(r[\"avg_ts\"]):.1f}" for r in rows))')
     echo "    $pp t/s"
-    results+=("$label | PPL $ppl ($check) | $pp")
+    results+=("$label | PPL $ppl ($pcheck) | $pp")
 done
 
 echo
-echo "=== summary (higher t/s is faster; PPL must match the first candidate)"
+echo "=== summary (lower us/run and higher t/s are faster; check=ok and PPL must match the first candidate)"
 printf '%s\n' "${results[@]}"

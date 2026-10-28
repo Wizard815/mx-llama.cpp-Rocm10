@@ -497,6 +497,23 @@ static bool backend_has_feature(ggml_backend_t backend, const char * feature_nam
     return false;
 }
 
+// The extra weight buffer type a GPU device offers (CUDA/HIP: the gfx906
+// "ROCm<N>_Repacked" buft that the model loader puts Q8_0 weights in), or nullptr.
+static ggml_backend_buffer_type_t get_repack_buft(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    if (get_extra_bufts == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t * bufts = get_extra_bufts(dev);
+    return bufts != nullptr ? bufts[0] : nullptr;
+}
+
 enum test_mode {
     MODE_TEST,
     MODE_PERF,
@@ -1292,6 +1309,9 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
+    // Weights go in the device's repacked buffer type (see get_repack_buft), so the
+    // repacked kernels run; the default path only ever uses the plain device buffer.
+    virtual bool use_repack_weights() { return false; }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1381,6 +1401,9 @@ struct test_case {
                        ggml_backend_t backend2,
                        const char *   op_names_filter,
                        printer *      output_printer) {
+        if (use_repack_weights()) {
+            return eval_repack(backend1, backend2, op_names_filter, output_printer);
+        }
         mode = MODE_TEST;
 
         ggml_init_params params = {
@@ -1569,6 +1592,131 @@ struct test_case {
         return test_passed ? test_status_t::OK : test_status_t::FAIL;
     }
 
+    // Test path for use_repack_weights(). The repacked buffer has no get_tensor (its
+    // layout is not canonical), so ggml_backend_compare_graph_backend cannot copy the
+    // graph to the reference backend. Instead the graph runs on backend2 first with
+    // every tensor in canonical layout, then the same tensors are moved to backend1
+    // (weights into the repacked buft) with the same data, and only the outputs are
+    // compared.
+    test_status_t eval_repack(ggml_backend_t backend1,
+                              ggml_backend_t backend2,
+                              const char *   op_names_filter,
+                              printer *      output_printer) {
+        mode = MODE_TEST;
+        GGML_ASSERT(use_weight_context());
+
+        ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
+            /* .mem_base = */ NULL,
+            /* .no_alloc = */ true,
+        };
+        ggml_context_ptr ctx(ggml_init(params));
+        ggml_context_ptr ctx_weights(ggml_init(params));
+        GGML_ASSERT(ctx && ctx_weights);
+
+        ggml_tensor * out = build_graph(ctx.get(), ctx_weights.get());
+        current_op_name   = op_desc(out);
+        if (!matches_filter(out, op_names_filter)) {
+            return test_status_t::SKIPPED;
+        }
+
+        ggml_backend_buffer_type_t buft = get_repack_buft(backend1);
+        if (buft == nullptr || !ggml_backend_supports_op(backend2, out)) {
+            test_result result(ggml_backend_name(buft == nullptr ? backend1 : backend2), current_op_name, vars(), "test",
+                               false, false, "not supported");
+            print_test_result_locked(output_printer, result);
+            return test_status_t::NOT_SUPPORTED;
+        }
+
+        gf = ggml_new_graph(ctx.get());
+        ggml_build_forward_expand(gf, out);
+
+        // reference run, canonical layout on backend2
+        ggml_backend_buffer_ptr buf2_weights(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend2));
+        ggml_backend_buffer_ptr buf2(ggml_backend_alloc_ctx_tensors(ctx.get(), backend2));
+        if (buf2_weights == NULL || buf2 == NULL) {
+            printf("failed to allocate tensors [%s] ", ggml_backend_name(backend2));
+            return test_status_t::FAIL;
+        }
+        initialize_tensors(ctx.get());
+        initialize_tensors(ctx_weights.get());
+
+        std::vector<std::pair<ggml_tensor *, std::vector<uint8_t>>> inputs;
+        for (ggml_context * c : {ctx_weights.get(), ctx.get()}) {
+            for (ggml_tensor * t = ggml_get_first_tensor(c); t != NULL; t = ggml_get_next_tensor(c, t)) {
+                if (t->view_src == nullptr && t->op == GGML_OP_NONE) {
+                    std::vector<uint8_t> data(ggml_nbytes(t));
+                    ggml_backend_tensor_get(t, data.data(), 0, data.size());
+                    inputs.emplace_back(t, std::move(data));
+                }
+            }
+        }
+
+        if (ggml_backend_graph_compute(backend2, gf) != GGML_STATUS_SUCCESS) {
+            printf("graph compute failed [%s] ", ggml_backend_name(backend2));
+            return test_status_t::FAIL;
+        }
+        const std::vector<float> f2 = tensor_to_float(out);
+
+        // same tensors and data on backend1, weights in the repacked buft
+        for (ggml_context * c : {ctx_weights.get(), ctx.get()}) {
+            for (ggml_tensor * t = ggml_get_first_tensor(c); t != NULL; t = ggml_get_next_tensor(c, t)) {
+                t->data   = nullptr;
+                t->buffer = nullptr;
+                t->extra  = nullptr;
+            }
+        }
+        ggml_backend_buffer_ptr buf1_weights(ggml_backend_alloc_ctx_tensors_from_buft(ctx_weights.get(), buft));
+        if (buf1_weights == NULL) {
+            printf("failed to allocate weight tensors [%s] ", ggml_backend_buft_name(buft));
+            return test_status_t::FAIL;
+        }
+        ggml_backend_buffer_set_usage(buf1_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_ptr buf1(ggml_backend_alloc_ctx_tensors(ctx.get(), backend1));
+        if (buf1 == NULL) {
+            printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
+            return test_status_t::FAIL;
+        }
+        for (auto & [t, data] : inputs) {
+            ggml_backend_tensor_set(t, data.data(), 0, data.size());
+        }
+
+        // supports_op looks at the weight's buffer, so it is only meaningful now
+        if (!ggml_backend_supports_op(backend1, out)) {
+            test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test",
+                               false, false, "not supported");
+            print_test_result_locked(output_printer, result);
+            return test_status_t::NOT_SUPPORTED;
+        }
+
+        if (ggml_backend_graph_compute(backend1, gf) != GGML_STATUS_SUCCESS) {
+            printf("graph compute failed [%s] ", ggml_backend_name(backend1));
+            return test_status_t::FAIL;
+        }
+        const std::vector<float> f1 = tensor_to_float(out);
+
+        bool ok = f1.size() == f2.size();
+        for (size_t i = 0; ok && i < f1.size(); i++) {
+            if (!std::isfinite(f1[i]) || !std::isfinite(f2[i])) {
+                printf("[%s] non-finite at index %zu (%s=%f %s=%f) ", ggml_op_desc(out), i,
+                       ggml_backend_name(backend1), f1[i], ggml_backend_name(backend2), f2[i]);
+                ok = false;
+            }
+        }
+        if (ok) {
+            const double e = err(f1.data(), f2.data(), f1.size());
+            if (e > max_err(backend1)) {
+                printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(out), e, max_err(backend1));
+                ok = false;
+            }
+        }
+
+        test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, ok,
+                           ok ? "" : "test failed");
+        print_test_result_locked(output_printer, result);
+        return ok ? test_status_t::OK : test_status_t::FAIL;
+    }
+
     bool eval_perf(ggml_backend_t backend, const char * op_names_filter, printer * output_printer) {
         mode = MODE_PERF;
 
@@ -1605,7 +1753,18 @@ struct test_case {
 
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
+            if (use_repack_weights()) {
+                ggml_backend_buffer_type_t buft = get_repack_buft(backend);
+                if (buft == nullptr) {
+                    test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", false, false,
+                                       "not supported");
+                    output_printer->print_test_result(result);
+                    return true;
+                }
+                buf_weights.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_weights.get(), buft));
+            } else {
+                buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
+            }
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors\n");
                 return false;
@@ -5542,6 +5701,91 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_W4A4";
+    }
+};
+
+// GGML_OP_MUL_MAT (n_mats == 0) or GGML_OP_MUL_MAT_ID with the weights in the
+// device's repacked buffer type, as the model loader places them on gfx906. This is
+// the only test path that runs the q8_repack prefill GEMMs
+// (mmq_gemm_repacked / mmq_gemm_repacked_w32); everything else uses canonical weights.
+struct test_mul_mat_repack : public test_case {
+    const ggml_type type_a;
+    const int n_mats;   // 0: dense MUL_MAT
+    const int n_used;
+    const bool b;       // MUL_MAT_ID: broadcast b (up/gate) or one row per expert (down)
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_REPACK";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, n_mats, n_used, b, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * (n_mats == 0 ? 1 : n_used);
+    }
+
+    bool use_weight_context() override { return true; }
+    bool use_repack_weights() override { return true; }
+
+    test_mul_mat_repack(ggml_type type_a = GGML_TYPE_Q8_0, int n_mats = 0, int n_used = 1, bool b = false,
+            int64_t m = 2048, int64_t n = 1024, int64_t k = 2048)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k) {
+            GGML_ASSERT(n_used <= std::max(n_mats, 1));
+        }
+
+    // support / grad / coverage modes build without a weight context
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        if (n_mats == 0) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx_weights, type_a, k, m);
+            ggml_set_name(a, "a");
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_set_name(b, "b");
+            ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+            ggml_set_name(out, "out");
+            return out;
+        }
+
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, this->b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, std::max(n_mats, 1));
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        if (n_mats > 0) {
+            init_mul_mat_id_ids(ctx, n_mats);
+        }
     }
 };
 
@@ -11938,6 +12182,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Repacked Q8_0 prefill GEMMs (gfx906 q8_repack buft; not supported elsewhere).
+    // Dense >= 128 tokens takes mmq_gemm_repacked, MoE the 32-wide mmq_gemm_repacked_w32;
+    // n = 200 / 77 leave partial column tiles.
+    for (int n : { 128, 200 }) {
+        test_cases.emplace_back(new test_mul_mat_repack(GGML_TYPE_Q8_0, 0, 1, false, 2048, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_repack(GGML_TYPE_Q8_0, 0, 1, false, 512,  n, 2048));
+        test_cases.emplace_back(new test_mul_mat_repack(GGML_TYPE_Q8_0, 0, 1, false, 2048, n, 512));
+    }
+    for (int n : { 77, 256 }) {
+        test_cases.emplace_back(new test_mul_mat_repack(GGML_TYPE_Q8_0, 256, 8, true,  512,  n, 2048));
+        test_cases.emplace_back(new test_mul_mat_repack(GGML_TYPE_Q8_0, 256, 8, false, 2048, n, 512));
+        test_cases.emplace_back(new test_mul_mat_repack(GGML_TYPE_Q8_0, 32,  8, true,  512,  n, 2048));
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -12456,6 +12714,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+    // Repacked Q8_0 prefill GEMMs (gfx906 q8_repack buft) at the Tiel-Coder /
+    // Qwen3.5-35B-A3B shapes: hidden 2048, 256 experts x 512, 8 used, -ub 1024.
+    // Dense: linear-attn qkv / z, full-attn q, out proj, shared expert.
+    for (int n : { 512, 1024 }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ {8192, 2048}, {4096, 2048}, {2048, 4096}, {512, 2048}, {2048, 512} }) {
+            test_cases.emplace_back(new test_mul_mat_repack(GGML_TYPE_Q8_0, 0, 1, false, m, n, k));
+        }
+        // MoE up/gate (broadcast b) and down
+        test_cases.emplace_back(new test_mul_mat_repack(GGML_TYPE_Q8_0, 256, 8, true,  512,  n, 2048));
+        test_cases.emplace_back(new test_mul_mat_repack(GGML_TYPE_Q8_0, 256, 8, false, 2048, n, 512));
+    }
 
     return test_cases;
 }
