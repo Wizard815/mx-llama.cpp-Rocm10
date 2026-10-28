@@ -3,6 +3,7 @@
 #include "repack.cuh"
 #include "repack-common.cuh"
 #include "repack-kernels.cuh"
+#include "repack-gcn-tune.h"
 #include "../quantize.cuh"
 #include "../mmq.cuh"
 #include "../mmid.cuh"
@@ -213,29 +214,36 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     // The 64-wide tile spills 5 VGPR (occupancy 2 against the 32-wide's 3), so it
     // only pays once every expert can fill it twice. Columns come per expert, not
     // per ubatch, which is why the crossover moves with the expert count.
-    const bool use_w32 = n_assign < 2 * BN_ID * ne02;
+    const bool use_w32 = n_assign < GGML_RP_Q8_MOE_W32_FACTOR * BN_ID * ne02;
 
     switch (src0->type) {
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4: {
             const bool is_mx = src0->type == GGML_TYPE_MXFP4;
-            if (use_w32) {
+            if (use_w32 && !is_mx) {
+                // Q8_0 tile from repack-gcn-tune.h (default TN 1, NRL 8)
+                constexpr int tn_q8  = GGML_RP_Q8_MOE_W32_TN;
+                constexpr int nrl_q8 = GGML_RP_Q8_MOE_W32_NRL;
+                constexpr int bn_q8  = 32 * tn_q8;
+                const int64_t max_tiles_q8 = n_assign / bn_q8 + ne02;
+                ggml_cuda_pool_alloc<int32_t>          tile_off_q8 (ctx.pool(), ne02 + 1);
+                ggml_cuda_pool_alloc<repack_tile_meta> tile_meta_q8(ctx.pool(), max_tiles_q8);
+                repack_tile_off<bn_q8><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off_q8.get(), tile_meta_q8.get(), ne02);
+                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles_q8, 1);
+                mmq_gemm_repacked_w32<true, tn_q8, nrl_q8, GGML_TYPE_Q8_0><<<grid, dim3(32, nrl_q8), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_q8.get(), tile_meta_q8.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+            } else if (use_w32) {
                 const int64_t max_tiles_w32 = n_assign / BN_W32 + ne02;
                 ggml_cuda_pool_alloc<int32_t>          tile_off_w32 (ctx.pool(), ne02 + 1);
                 ggml_cuda_pool_alloc<repack_tile_meta> tile_meta_w32(ctx.pool(), max_tiles_w32);
                 repack_tile_off<BN_W32><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(), ne02);
                 const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles_w32, 1);
-                if (is_mx) {
                 mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_MXFP4><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
                     ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
                     (uint32_t) ne02, expert_stride, dst_s1);
-                } else {
-                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q8_0><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
-                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
-                    (uint32_t) ne02, expert_stride, dst_s1);
-                }
             } else {
                 const int64_t max_tiles = n_assign / BN_ID + ne02;
                 ggml_cuda_pool_alloc<int32_t>           tile_off (ctx.pool(), ne02 + 1);

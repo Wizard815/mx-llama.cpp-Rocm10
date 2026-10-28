@@ -3,6 +3,7 @@
 #include "repack.cuh"
 #include "repack-common.cuh"
 #include "repack-kernels.cuh"
+#include "repack-gcn-tune.h"
 #include "../quantize.cuh"
 #include "../mmq.cuh"
 
@@ -347,11 +348,15 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const dim3 grid((ne01 + mmq_bm - 1) / mmq_bm,
                         (ne11 + bn - 1) / bn, 1);
         switch (src0->type) {
-            case GGML_TYPE_Q8_0:
-                mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q8_0><<<grid, dim3(64, nrl), 0, stream>>>(
+            case GGML_TYPE_Q8_0: {
+                // tile from repack-gcn-tune.h (default = MMQ_RP_Q8_TN / MMQ_RP_Q8_NROW_LANES)
+                constexpr int tn_q8  = GGML_RP_Q8_DENSE_TN;
+                constexpr int nrl_q8 = GGML_RP_Q8_DENSE_NRL;
+                const dim3 grid_q8((ne01 + mmq_bm - 1) / mmq_bm, (ne11 + 64 * tn_q8 - 1) / (64 * tn_q8), 1);
+                mmq_gemm_repacked<false, tn_q8, nrl_q8, GGML_TYPE_Q8_0><<<grid_q8, dim3(64, nrl_q8), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
-                break;
+            } break;
             case GGML_TYPE_MXFP4:
                 mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_MXFP4><<<grid, dim3(64, nrl), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
