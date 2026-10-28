@@ -29,6 +29,12 @@
 #ifndef GGML_RP_Q8_MOE_W32_NRL
 #define GGML_RP_Q8_MOE_W32_NRL 8
 #endif
+// MoE block order: 1 = expert by expert (weights and activations re-read from L2,
+// see mmq_gemm_repacked_impl GROUPED), 0 = row block fastest. Run-time override:
+// GGML_CUDA_REPACK_MOE_GROUPED=0/1.
+#ifndef GGML_RP_Q8_MOE_GROUPED
+#define GGML_RP_Q8_MOE_GROUPED 0
+#endif
 // MoE: use the 32-wide tile while n_assign < FACTOR * 128 * n_expert (64-wide otherwise)
 #ifndef GGML_RP_Q8_MOE_W32_FACTOR
 #define GGML_RP_Q8_MOE_W32_FACTOR 2

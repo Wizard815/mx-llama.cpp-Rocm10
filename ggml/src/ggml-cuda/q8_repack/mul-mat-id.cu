@@ -34,6 +34,16 @@ static void repack_tile_stats_dump() {
         (unsigned long long) g_tile_tail_hist[4].load());
 }
 
+// Grouped block order for the Q8_0 MoE GEMM (see mmq_gemm_repacked_impl GROUPED):
+// GGML_RP_Q8_MOE_GROUPED, overridable at run time with GGML_CUDA_REPACK_MOE_GROUPED=0/1.
+static bool repack_moe_grouped() {
+    static const bool grouped = [] {
+        const char * env = getenv("GGML_CUDA_REPACK_MOE_GROUPED");
+        return env != nullptr ? atoi(env) != 0 : GGML_RP_Q8_MOE_GROUPED != 0;
+    }();
+    return grouped;
+}
+
 static void repack_tile_stats(const int32_t * expert_bounds_d, int64_t n_expert, int bn, cudaStream_t stream) {
 #if defined(GGML_USE_HIP)
     static const bool enabled = getenv("GGML_CUDA_REPACK_TILE_STATS") != nullptr;
@@ -289,11 +299,20 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                 ggml_cuda_pool_alloc<int32_t>          tile_off_q8 (ctx.pool(), ne02 + 1);
                 ggml_cuda_pool_alloc<repack_tile_meta> tile_meta_q8(ctx.pool(), max_tiles_q8);
                 repack_tile_off<bn_q8><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off_q8.get(), tile_meta_q8.get(), ne02);
-                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles_q8, 1);
-                mmq_gemm_repacked_cw<true, cw_q8, tn_q8, nrl_q8, GGML_TYPE_Q8_0, GGML_RP_Q8_MOE_W32_MINB><<<grid, dim3(cw_q8, nrl_q8), 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
-                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_q8.get(), tile_meta_q8.get(),
-                    (uint32_t) ne02, expert_stride, dst_s1);
+                const int64_t gx = (ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM;
+                if (repack_moe_grouped()) {
+                    mmq_gemm_repacked_cw<true, cw_q8, tn_q8, nrl_q8, GGML_TYPE_Q8_0, GGML_RP_Q8_MOE_W32_MINB, true>
+                        <<<dim3(gx * max_tiles_q8, 1, 1), dim3(cw_q8, nrl_q8), 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                        ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_q8.get(), tile_meta_q8.get(),
+                        (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                    mmq_gemm_repacked_cw<true, cw_q8, tn_q8, nrl_q8, GGML_TYPE_Q8_0, GGML_RP_Q8_MOE_W32_MINB>
+                        <<<dim3(gx, max_tiles_q8, 1), dim3(cw_q8, nrl_q8), 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                        ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_q8.get(), tile_meta_q8.get(),
+                        (uint32_t) ne02, expert_stride, dst_s1);
+                }
                 repack_tile_stats(expert_bounds.get(), ne02, bn_q8, stream);
             } else if (use_w32) {
                 const int64_t max_tiles_w32 = n_assign / BN_W32 + ne02;
