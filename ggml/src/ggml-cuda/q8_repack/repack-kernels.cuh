@@ -9,6 +9,8 @@
 #include "../unary.cuh"
 #include "repack-common.cuh"
 
+#include <type_traits>
+
 struct repack_tile_meta {
     uint32_t expert;
     uint32_t a_base;
@@ -516,7 +518,9 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
 #endif
 }
 
-template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL>
+// OPT (bit mask, 0 = the original kernel): bit 0 skews the LDS weight tile per row
+// group, see sW_lo below.
+template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL, int OPT = 0>
 static __device__ void mmq_gemm_repacked_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -531,6 +535,7 @@ static __device__ void mmq_gemm_repacked_impl(
     const int ty = threadIdx.y;
     const uint32_t row0 = blockIdx.x * MMQ_RP_Q8_BM;
     constexpr uint32_t BN = CW * TN_;
+    static_assert(BN % 32 == 0 || BN <= 16, "sX_swizzle permutes within 32-column groups");
     uint32_t tok0 = blockIdx.y * BN;
     uint32_t a_base = 0, a_end = 0;
     if constexpr (HAS_IDS) {
@@ -562,8 +567,17 @@ static __device__ void mmq_gemm_repacked_impl(
     // LDS stays expanded: expanding at consume instead multiplied the expand
     // by the row*column reuse and measured -40% prefill.
     constexpr bool RAW_REG = rp_traits<WT>::raw_lds;
-    __shared__ uint4    sW_lo[MMQ_RP_Q8_BM][MMQ_RP_Q8_BK];
-    __shared__ uint4    sW_hi[MMQ_RP_Q8_BM][MMQ_RP_Q8_BK];
+    // A wave spans 64/CW row groups (ty) whose rows ty*NROW + r sit NROW*BK uint4 apart,
+    // a multiple of the 32 LDS banks, so below CW 64 every weight ds_read_b128 is a
+    // 64/CW-way bank conflict (CW 8: ~4 conflict cycles per LDS instruction, 19% of the
+    // MoE kernel's time). OPT bit 0 adds one uint4 per row group: group g starts at bank
+    // 4*g, and the 8 groups of a CW 8 wave cover all 32 banks once.
+    constexpr int W_SKEW = (OPT & 1) != 0 ? 1 : 0;
+    __shared__ uint4    sW_lo[MMQ_RP_Q8_BM * MMQ_RP_Q8_BK + NRL * W_SKEW];
+    __shared__ uint4    sW_hi[MMQ_RP_Q8_BM * MMQ_RP_Q8_BK + NRL * W_SKEW];
+    auto widx = [](const int lr, const int lk) {
+        return lr * MMQ_RP_Q8_BK + lk + (lr / (MMQ_RP_Q8_BM / NRL)) * W_SKEW;
+    };
     using slot_t = typename rp_traits<WT>::slot_t;
     static_assert(16 % sizeof(slot_t) == 0, "slot must divide a uint4 fetch");
     constexpr int SPW = (int) (16 / sizeof(slot_t));   // slots per uint4 LDS fetch
@@ -577,13 +591,19 @@ static __device__ void mmq_gemm_repacked_impl(
     constexpr int NROW = MMQ_RP_Q8_BM / NRL;
     float acc[NROW][TN_] = {};
 
+    // Row scales come from LDS SPF at a time: a uint4 of SPW slots, or a narrower
+    // fetch when a thread owns fewer rows (a uint4 would run into the next thread's
+    // rows and past acc[NROW]).
+    constexpr int SPF = NROW < SPW ? NROW : SPW;
+    constexpr int SFB = SPF * (int) sizeof(slot_t);
+    static_assert(NROW % SPF == 0 && (SFB == 16 || SFB == 8 || SFB == 4), "unsupported rows per thread");
+    using sfetch_t = std::conditional_t<SFB == 16, uint4, std::conditional_t<SFB == 8, uint2, uint32_t>>;
+
     constexpr int NTHREADS = CW * NRL;
     constexpr int W_ELM = MMQ_RP_Q8_BM * MMQ_RP_Q8_BK;
     constexpr int X_ELM = BN * MMQ_RP_Q8_BK;
     constexpr int W_EPT = (W_ELM + NTHREADS - 1) / NTHREADS;
     constexpr int X_EPT = (X_ELM + NTHREADS - 1) / NTHREADS;
-
-    const int sxc0 = sX_swizzle<CW>(tx);
 
     uint4    pw_lo[W_EPT];
     uint4    pw_hi[W_EPT];
@@ -733,11 +753,11 @@ static __device__ void mmq_gemm_repacked_impl(
             if constexpr (RAW_REG) {
                 uint4 lo, hi;
                 rp_traits<WT>::expand_raw(pw_lo[i], lo, hi);
-                sW_lo[lr][lk] = lo;
-                sW_hi[lr][lk] = hi;
+                sW_lo[widx(lr, lk)] = lo;
+                sW_hi[widx(lr, lk)] = hi;
             } else {
-                sW_lo[lr][lk] = pw_lo[i];
-                sW_hi[lr][lk] = pw_hi[i];
+                sW_lo[widx(lr, lk)] = pw_lo[i];
+                sW_hi[widx(lr, lk)] = pw_hi[i];
             }
             sWdh [lk][lr] = pw_d[i];
         }
@@ -762,101 +782,107 @@ static __device__ void mmq_gemm_repacked_impl(
         }
     };
 
+    auto compute_kk = [&](const int kk) {
+        float dx  [TN_];
+        [[maybe_unused]] float sx[TN_];
+        int   xq32[TN_][8];
+#pragma unroll
+        for (int n = 0; n < TN_; n++) {
+            // swizzle the whole column: for CW < 32 a thread's columns span swizzle groups
+            const int xcol = sX_swizzle<CW>(tx + n * CW);
+            const uint4 q0 = sXq[xcol].q[kk][0];
+            const uint4 q1 = sXq[xcol].q[kk][1];
+            dx[n] = sXd[xcol][kk];
+            if constexpr (rp_traits<WT>::affine) {
+                sx[n] = sXs[xcol][kk];
+            }
+            xq32[n][0] = (int) q0.x;
+            xq32[n][1] = (int) q0.y;
+            xq32[n][2] = (int) q0.z;
+            xq32[n][3] = (int) q0.w;
+            xq32[n][4] = (int) q1.x;
+            xq32[n][5] = (int) q1.y;
+            xq32[n][6] = (int) q1.z;
+            xq32[n][7] = (int) q1.w;
+        }
+        const int row_base = ty * NROW;
+        uint4 wlo = sW_lo[widx(row_base, kk)];
+        uint4 whi = sW_hi[widx(row_base, kk)];
+        const sfetch_t * dpf = reinterpret_cast<const sfetch_t *>(&sWdh[kk][row_base]);
+
+#pragma unroll
+        for (int g = 0; g < NROW; g += SPF) {
+            const sfetch_t dhf = dpf[g / SPF];
+            const slot_t * dh = reinterpret_cast<const slot_t *>(&dhf);
+
+#pragma unroll
+            for (int rr = 0; rr < SPF; rr++) {
+                const int r = g + rr;
+
+                const uint4 wlo_c = wlo, whi_c = whi;
+                if (r + 1 < NROW) {
+                    wlo = sW_lo[widx(row_base + r + 1, kk)];
+                    whi = sW_hi[widx(row_base + r + 1, kk)];
+                }
+
+                [[maybe_unused]] float d = 0.0f, dlo = 0.0f, dhi = 0.0f;
+                if constexpr (rp_traits<WT>::split_scales || rp_traits<WT>::affine) {
+                    const float2 dd = rp_traits<WT>::scale2(dh[rr]);
+                    dlo = dd.x;
+                    dhi = dd.y;
+                } else {
+                    d = rp_traits<WT>::scale(dh[rr]);
+                }
+
+#pragma unroll
+                for (int n = 0; n < TN_; n++) {
+                    if constexpr (WT == GGML_TYPE_MXFP4 || rp_traits<WT>::split_scales) {
+                        // Stock MXFP4 uses MMQ_DP4A_TXS_Q8_1, i.e. it applies the
+                        // scale per 16-value HALF block, while Q8_0 uses TXS_Q8_0
+                        // and scales per 32. Split the accumulator the same way -
+                        // d*(lo) + d*(hi) instead of d*(lo+hi) - or the result is
+                        // mathematically equal but not bit-identical to stock.
+                        int lo = 0, hi = 0;
+                        lo = ggml_cuda_dp4a((int) wlo_c.x, xq32[n][0], lo);
+                        lo = ggml_cuda_dp4a((int) wlo_c.y, xq32[n][1], lo);
+                        lo = ggml_cuda_dp4a((int) wlo_c.z, xq32[n][2], lo);
+                        lo = ggml_cuda_dp4a((int) wlo_c.w, xq32[n][3], lo);
+                        hi = ggml_cuda_dp4a((int) whi_c.x, xq32[n][4], hi);
+                        hi = ggml_cuda_dp4a((int) whi_c.y, xq32[n][5], hi);
+                        hi = ggml_cuda_dp4a((int) whi_c.z, xq32[n][6], hi);
+                        hi = ggml_cuda_dp4a((int) whi_c.w, xq32[n][7], hi);
+                        if constexpr (rp_traits<WT>::split_scales) {
+                            // Per-16-value scales (Q6_K): each half gets its own.
+                            acc[r][n] += dlo * dx[n] * (float) lo + dhi * dx[n] * (float) hi;
+                        } else {
+                            acc[r][n] += d * dx[n] * (float) lo + d * dx[n] * (float) hi;
+                        }
+                    } else {
+                    int idot = 0;
+                    idot = ggml_cuda_dp4a((int) wlo_c.x, xq32[n][0], idot);
+                    idot = ggml_cuda_dp4a((int) whi_c.x, xq32[n][4], idot);
+                    idot = ggml_cuda_dp4a((int) wlo_c.y, xq32[n][1], idot);
+                    idot = ggml_cuda_dp4a((int) whi_c.y, xq32[n][5], idot);
+                    idot = ggml_cuda_dp4a((int) wlo_c.z, xq32[n][2], idot);
+                    idot = ggml_cuda_dp4a((int) whi_c.z, xq32[n][6], idot);
+                    idot = ggml_cuda_dp4a((int) wlo_c.w, xq32[n][3], idot);
+                    idot = ggml_cuda_dp4a((int) whi_c.w, xq32[n][7], idot);
+                    if constexpr (rp_traits<WT>::affine) {
+                        // Affine (Q4_K): d*sc times the dot, minus dmin*m times the sum.
+                        acc[r][n] += dlo * dx[n] * (float) idot - dhi * sx[n];
+                    } else {
+                        acc[r][n] += d * dx[n] * (float) idot;
+                    }
+                    }
+                }
+            }
+        }
+    };
+    // The kk loop stays rolled: unrolling it (tried on the CW 8 MoE kernel) needs more
+    // than 256 VGPR and spills, 4x slower.
     auto compute_stage = [&]() {
         for (int kk = 0; kk < MMQ_RP_Q8_BK; kk++) {
-            float dx  [TN_];
-            [[maybe_unused]] float sx[TN_];
-            int   xq32[TN_][8];
-#pragma unroll
-            for (int n = 0; n < TN_; n++) {
-                const int xcol = sxc0 + n * CW;
-                const uint4 q0 = sXq[xcol].q[kk][0];
-                const uint4 q1 = sXq[xcol].q[kk][1];
-                dx[n] = sXd[xcol][kk];
-                if constexpr (rp_traits<WT>::affine) {
-                    sx[n] = sXs[xcol][kk];
-                }
-                xq32[n][0] = (int) q0.x;
-                xq32[n][1] = (int) q0.y;
-                xq32[n][2] = (int) q0.z;
-                xq32[n][3] = (int) q0.w;
-                xq32[n][4] = (int) q1.x;
-                xq32[n][5] = (int) q1.y;
-                xq32[n][6] = (int) q1.z;
-                xq32[n][7] = (int) q1.w;
-            }
-            const int row_base = ty * NROW;
-            uint4 wlo = sW_lo[row_base][kk];
-            uint4 whi = sW_hi[row_base][kk];
-            const uint4 * dp16 = reinterpret_cast<const uint4 *>(&sWdh[kk][row_base]);
-
-#pragma unroll
-            for (int g = 0; g < NROW; g += SPW) {
-                const uint4 dh4 = dp16[g / SPW];
-                const slot_t * dh = reinterpret_cast<const slot_t *>(&dh4);
-
-#pragma unroll
-                for (int rr = 0; rr < SPW; rr++) {
-                    const int r = g + rr;
-
-                    const uint4 wlo_c = wlo, whi_c = whi;
-                    if (r + 1 < NROW) {
-                        wlo = sW_lo[row_base + r + 1][kk];
-                        whi = sW_hi[row_base + r + 1][kk];
-                    }
-
-                    [[maybe_unused]] float d = 0.0f, dlo = 0.0f, dhi = 0.0f;
-                    if constexpr (rp_traits<WT>::split_scales || rp_traits<WT>::affine) {
-                        const float2 dd = rp_traits<WT>::scale2(dh[rr]);
-                        dlo = dd.x;
-                        dhi = dd.y;
-                    } else {
-                        d = rp_traits<WT>::scale(dh[rr]);
-                    }
-
-#pragma unroll
-                    for (int n = 0; n < TN_; n++) {
-                        if constexpr (WT == GGML_TYPE_MXFP4 || rp_traits<WT>::split_scales) {
-                            // Stock MXFP4 uses MMQ_DP4A_TXS_Q8_1, i.e. it applies the
-                            // scale per 16-value HALF block, while Q8_0 uses TXS_Q8_0
-                            // and scales per 32. Split the accumulator the same way -
-                            // d*(lo) + d*(hi) instead of d*(lo+hi) - or the result is
-                            // mathematically equal but not bit-identical to stock.
-                            int lo = 0, hi = 0;
-                            lo = ggml_cuda_dp4a((int) wlo_c.x, xq32[n][0], lo);
-                            lo = ggml_cuda_dp4a((int) wlo_c.y, xq32[n][1], lo);
-                            lo = ggml_cuda_dp4a((int) wlo_c.z, xq32[n][2], lo);
-                            lo = ggml_cuda_dp4a((int) wlo_c.w, xq32[n][3], lo);
-                            hi = ggml_cuda_dp4a((int) whi_c.x, xq32[n][4], hi);
-                            hi = ggml_cuda_dp4a((int) whi_c.y, xq32[n][5], hi);
-                            hi = ggml_cuda_dp4a((int) whi_c.z, xq32[n][6], hi);
-                            hi = ggml_cuda_dp4a((int) whi_c.w, xq32[n][7], hi);
-                            if constexpr (rp_traits<WT>::split_scales) {
-                                // Per-16-value scales (Q6_K): each half gets its own.
-                                acc[r][n] += dlo * dx[n] * (float) lo + dhi * dx[n] * (float) hi;
-                            } else {
-                                acc[r][n] += d * dx[n] * (float) lo + d * dx[n] * (float) hi;
-                            }
-                        } else {
-                        int idot = 0;
-                        idot = ggml_cuda_dp4a((int) wlo_c.x, xq32[n][0], idot);
-                        idot = ggml_cuda_dp4a((int) whi_c.x, xq32[n][4], idot);
-                        idot = ggml_cuda_dp4a((int) wlo_c.y, xq32[n][1], idot);
-                        idot = ggml_cuda_dp4a((int) whi_c.y, xq32[n][5], idot);
-                        idot = ggml_cuda_dp4a((int) wlo_c.z, xq32[n][2], idot);
-                        idot = ggml_cuda_dp4a((int) whi_c.z, xq32[n][6], idot);
-                        idot = ggml_cuda_dp4a((int) wlo_c.w, xq32[n][3], idot);
-                        idot = ggml_cuda_dp4a((int) whi_c.w, xq32[n][7], idot);
-                        if constexpr (rp_traits<WT>::affine) {
-                            // Affine (Q4_K): d*sc times the dot, minus dmin*m times the sum.
-                            acc[r][n] += dlo * dx[n] * (float) idot - dhi * sx[n];
-                        } else {
-                            acc[r][n] += d * dx[n] * (float) idot;
-                        }
-                        }
-                    }
-                }
-            }
+            compute_kk(kk);
         }
     };
 
@@ -942,8 +968,11 @@ static __device__ void mmq_gemm_repacked_impl(
 }
 
 // Launch wrapper: 64-wide waves, tuned for large batches (ne11 >= 128).
-template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0>
-static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_repacked(
+// MINB = __launch_bounds__ second argument = amdgpu_waves_per_eu on HIP: minimum
+// waves per SIMD, so the VGPR budget is 256/MINB. A bigger tile under the same
+// MINB spills instead of losing occupancy.
+template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0, int MINB = 2>
+static __global__ void __launch_bounds__(64 * NRL, MINB) mmq_gemm_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t n_tok,
@@ -1216,8 +1245,9 @@ static __global__ void mul_mat_vec_repacked_id1_fused(
 #endif
 }
 
-template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0>
-static __global__ void __launch_bounds__(32 * NRL, HAS_IDS && (WT == GGML_TYPE_Q4_K || WT == GGML_TYPE_Q5_K) ? 2 : 3) mmq_gemm_repacked_w32(
+template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0,
+          int MINB = HAS_IDS && (WT == GGML_TYPE_Q4_K || WT == GGML_TYPE_Q5_K) ? 2 : 3>
+static __global__ void __launch_bounds__(32 * NRL, MINB) mmq_gemm_repacked_w32(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t n_tok,
@@ -1227,6 +1257,29 @@ static __global__ void __launch_bounds__(32 * NRL, HAS_IDS && (WT == GGML_TYPE_Q
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     mmq_gemm_repacked_impl<WT, HAS_IDS, 32, TN_, NRL>(
+        wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
+        expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
+    NO_DEVICE_CODE;
+#endif
+}
+
+// Launch wrapper with the lane width as a parameter: the tile is CW*TN tokens wide
+// and each thread owns 64/NRL rows x TN tokens. Same tile width, fewer lanes and
+// more tokens per thread means each LDS weight read feeds TN tokens instead of one
+// (the MoE w32 kernel waits on LDS longer than it computes at TN=1).
+template <bool HAS_IDS, int CW, int TN_, int NRL, ggml_type WT, int MINB, int OPT = 0>
+static __global__ void __launch_bounds__(CW * NRL, MINB) mmq_gemm_repacked_cw(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const uint32_t n_tok,
+        const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
+        const repack_tile_meta * __restrict__ tile_meta,
+        const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    mmq_gemm_repacked_impl<WT, HAS_IDS, CW, TN_, NRL, OPT>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
 #else
