@@ -34,6 +34,17 @@ static void repack_tile_stats_dump() {
         (unsigned long long) g_tile_tail_hist[4].load());
 }
 
+// Kernel options for the Q8_0 MoE GEMM (mmq_gemm_repacked_impl OPT): bit 0 = skewed
+// LDS weight tile, bit 1 = unrolled kk loop. GGML_RP_Q8_MOE_OPT, run-time override
+// GGML_CUDA_REPACK_MOE_OPT=0..3.
+static int repack_moe_opt() {
+    static const int opt = [] {
+        const char * env = getenv("GGML_CUDA_REPACK_MOE_OPT");
+        return (env != nullptr ? atoi(env) : GGML_RP_Q8_MOE_OPT) & 3;
+    }();
+    return opt;
+}
+
 static void repack_tile_stats(const int32_t * expert_bounds_d, int64_t n_expert, int bn, cudaStream_t stream) {
 #if defined(GGML_USE_HIP)
     static const bool enabled = getenv("GGML_CUDA_REPACK_TILE_STATS") != nullptr;
@@ -290,10 +301,18 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                 ggml_cuda_pool_alloc<repack_tile_meta> tile_meta_q8(ctx.pool(), max_tiles_q8);
                 repack_tile_off<bn_q8><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off_q8.get(), tile_meta_q8.get(), ne02);
                 const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles_q8, 1);
-                mmq_gemm_repacked_cw<true, cw_q8, tn_q8, nrl_q8, GGML_TYPE_Q8_0, GGML_RP_Q8_MOE_W32_MINB><<<grid, dim3(cw_q8, nrl_q8), 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
-                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_q8.get(), tile_meta_q8.get(),
-                    (uint32_t) ne02, expert_stride, dst_s1);
+#define REPACK_MOE_Q8_LAUNCH(OPT_) \
+                mmq_gemm_repacked_cw<true, cw_q8, tn_q8, nrl_q8, GGML_TYPE_Q8_0, GGML_RP_Q8_MOE_W32_MINB, OPT_><<<grid, dim3(cw_q8, nrl_q8), 0, stream>>>( \
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols, \
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_q8.get(), tile_meta_q8.get(), \
+                    (uint32_t) ne02, expert_stride, dst_s1)
+                switch (repack_moe_opt()) {
+                    case 1:  REPACK_MOE_Q8_LAUNCH(1); break;
+                    case 2:  REPACK_MOE_Q8_LAUNCH(2); break;
+                    case 3:  REPACK_MOE_Q8_LAUNCH(3); break;
+                    default: REPACK_MOE_Q8_LAUNCH(0); break;
+                }
+#undef REPACK_MOE_Q8_LAUNCH
                 repack_tile_stats(expert_bounds.get(), ne02, bn_q8, stream);
             } else if (use_w32) {
                 const int64_t max_tiles_w32 = n_assign / BN_W32 + ne02;

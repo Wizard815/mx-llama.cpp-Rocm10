@@ -29,6 +29,12 @@
 #ifndef GGML_RP_Q8_MOE_W32_NRL
 #define GGML_RP_Q8_MOE_W32_NRL 8
 #endif
+// MoE kernel options (mmq_gemm_repacked_impl OPT): bit 0 = skewed LDS weight tile
+// (CW < 64 waves read 64/CW row groups that otherwise share banks), bit 1 = unrolled kk
+// loop. Run-time override: GGML_CUDA_REPACK_MOE_OPT=0..3.
+#ifndef GGML_RP_Q8_MOE_OPT
+#define GGML_RP_Q8_MOE_OPT 0
+#endif
 // MoE: use the 32-wide tile while n_assign < FACTOR * 128 * n_expert (64-wide otherwise)
 #ifndef GGML_RP_Q8_MOE_W32_FACTOR
 #define GGML_RP_Q8_MOE_W32_FACTOR 2

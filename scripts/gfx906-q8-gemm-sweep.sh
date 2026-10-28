@@ -83,6 +83,8 @@ for c in "${CANDIDATES[@]}"; do
     echo "=== $label"
     printf '#pragma once\n#define GGML_RP_Q8_DENSE_TN %s\n#define GGML_RP_Q8_DENSE_NRL %s\n#define GGML_RP_Q8_MOE_W32_TN %s\n#define GGML_RP_Q8_MOE_W32_NRL %s\n#define GGML_RP_Q8_MOE_W32_FACTOR %s\n#define GGML_RP_Q8_DENSE_MINB %s\n#define GGML_RP_Q8_MOE_W32_MINB %s\n#define GGML_RP_Q8_MOE_W32_CW %s\n' \
         "$dtn" "$dnrl" "$mtn" "$mnrl" "$fac" "$dmb" "$mmb" "$mcw" > "$TUNE"
+    # then the default header: its #ifndef guards fill in every knob not swept here
+    cat "$backup" >> "$TUNE"
 
     if ! cmake --build "$BUILD_DIR" --target "${TARGETS[@]}" -j"$(nproc)" > /tmp/q8-sweep-build.log 2>&1; then
         echo "    compile failed (see /tmp/q8-sweep-build.log)"
