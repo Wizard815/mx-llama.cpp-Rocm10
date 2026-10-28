@@ -445,6 +445,7 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    bool prev_decode_small  = false; // last decode was a small (< 32 token) batch, see decode()
 
     // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {

@@ -2257,6 +2257,27 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     sched_reserve();
 
+    // Small batches (generation, MTP verify) can be placed on different backends than a prompt batch
+    // (op offload starts at 32 tokens); the scheduler then re-plans for that small graph. A pipelined
+    // prompt that follows would outgrow that plan on every chunk as n_kv grows, and each re-plan
+    // drains the pipeline (~250 ms per 1024-token chunk with MTP on 2x MI50). Restore the worst-case
+    // prompt plan once at that transition instead.
+    {
+        const bool small = n_tokens_all < 32;
+        if (cparams.pipeline_parallel && !small && prev_decode_small && memory) {
+            const auto mctx = memory->init_full();
+            if (mctx) {
+                synchronize();
+                const uint32_t n_seqs   = cparams.n_seq_max;
+                const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+                if (!graph_reserve(n_tokens, n_seqs, std::min(n_tokens, cparams.n_outputs_max), mctx.get())) {
+                    LLAMA_LOG_WARN("%s: failed to restore the worst-case prompt graph plan\n", __func__);
+                }
+            }
+        }
+        prev_decode_small = small;
+    }
+
     bool did_optimize = false;
 
     // handle any pending shifts/copies
