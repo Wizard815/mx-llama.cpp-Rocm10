@@ -24,7 +24,8 @@ PERF_FILTER='head_count=16,head_size=128,n_seq_tokens=(1024|2048),n_seqs=1,v_rep
 if [ $# -gt 0 ]; then
     CANDIDATES=("$@")
 else
-    # First entry is the current default (2 warps, 2 columns, no unroll).
+    # First entry is the previous default (2 warps, 2 columns, no unroll); the gfx906
+    # default is now 4 2 1.
     # Warps per block is capped at 4 by the kernel's __launch_bounds__.
     CANDIDATES=(
         "2 2 0"
