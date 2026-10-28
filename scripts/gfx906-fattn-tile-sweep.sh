@@ -26,7 +26,7 @@ PERF_FILTER='hsk=256,hsv=256,nh=2,nr23=\[8,1\],kv=(8192|32768),nb=1024'
 if [ $# -gt 0 ]; then
     CANDIDATES=("$@")
 else
-    # First entry is the generic AMD table's value (the baseline).
+    # First entry is the generic AMD table's value; the gfx906 default is now 256 2 64 64.
     CANDIDATES=(
         "256 2 32 128"
         "256 2 32 64"
@@ -43,7 +43,13 @@ fi
 
 backup=$(mktemp)
 cp "$TUNE" "$backup"
-restore() { cp "$backup" "$TUNE"; rm -f "$backup"; }
+# Rebuild after restoring: binaries built in-tree load these libs (RUNPATH), so a
+# leftover candidate build would otherwise end up in whatever runs from this tree.
+restore() {
+    cp "$backup" "$TUNE"; rm -f "$backup"
+    echo "=== restoring default build"
+    cmake --build "$BUILD_DIR" --target test-backend-ops -j"$(nproc)" > /dev/null 2>&1 || echo "    rebuild failed, rebuild $BUILD_DIR manually"
+}
 trap restore EXIT
 
 results=()

@@ -322,6 +322,9 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
 static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_amd_gcn(const int DKQ, const int DV, const int ncols) {
 #ifdef GGML_FATTN_TILE_GCN_256_32
     GGML_CUDA_FATTN_TILE_CONFIG_CASE_EXPAND(256, 256, 32, GGML_FATTN_TILE_GCN_256_32)
+#else
+    // gfx906 sweep: 48.0 vs 59.5 ms at kv 32768 (generic AMD: 256, 2, 32, 128); pp8192 @ d32768 +8.7%
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  64,  64)
 #endif
 #ifdef GGML_FATTN_TILE_GCN_256_16
     GGML_CUDA_FATTN_TILE_CONFIG_CASE_EXPAND(256, 256, 16, GGML_FATTN_TILE_GCN_256_16)
