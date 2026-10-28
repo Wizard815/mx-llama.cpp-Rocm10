@@ -42,6 +42,44 @@ static __global__ void repack_tile_off(
 #endif
 }
 
+// Split tile lists: each expert's full BN-wide tiles in main_meta, its remainder in
+// BNT-wide tiles in tail_meta, so a tail of a few tokens no longer costs a whole BN
+// tile (real routing on a 256-expert model filled 64.5% of 32-wide tile slots). The
+// GEMM reads only off[n_expert] (the tile count) and meta[blockIdx.y].
+template <int BN, int BNT>
+static __global__ void repack_tile_off_split(
+        const int32_t * __restrict__ expert_bounds,
+        int32_t * __restrict__ main_off, repack_tile_meta * __restrict__ main_meta,
+        int32_t * __restrict__ tail_off, repack_tile_meta * __restrict__ tail_meta,
+        const int n_expert) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    static_assert(BNT < BN, "the tail tile must be narrower than the main tile");
+    if (threadIdx.x != 0 || blockIdx.x != 0) {
+        return;
+    }
+    int nm = 0, nt = 0;
+    for (int e = 0; e < n_expert; e++) {
+        const int b0   = expert_bounds[e];
+        const int cnt  = expert_bounds[e + 1] - b0;
+        const int full = cnt / BN;
+        for (int t = 0; t < full; t++, nm++) {
+            main_meta[nm].expert = (uint32_t) e;
+            main_meta[nm].a_base = (uint32_t) (b0 + t * BN);
+        }
+        const int rem = cnt - full * BN;
+        for (int t = 0; t < (rem + BNT - 1) / BNT; t++, nt++) {
+            tail_meta[nt].expert = (uint32_t) e;
+            tail_meta[nt].a_base = (uint32_t) (b0 + full * BN + t * BNT);
+        }
+    }
+    main_off[n_expert] = nm;
+    tail_off[n_expert] = nt;
+#else
+    GGML_UNUSED_VARS(expert_bounds, main_off, main_meta, tail_off, tail_meta, n_expert);
+    NO_DEVICE_CODE;
+#endif
+}
+
 static __device__ __forceinline__ int mmvq_dp4a_u4(
         const uint4 w, const int x0, const int x1, const int x2, const int x3) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)

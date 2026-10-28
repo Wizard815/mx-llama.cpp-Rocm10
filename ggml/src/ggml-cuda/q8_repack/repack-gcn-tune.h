@@ -29,6 +29,12 @@
 #ifndef GGML_RP_Q8_MOE_W32_NRL
 #define GGML_RP_Q8_MOE_W32_NRL 8
 #endif
+// MoE tail tiles: each expert's tokens past its last full CW*TN tile run in a second
+// launch with a narrower tile (16: CW 8 TN 2 NRL 8, 8: CW 8 TN 1 NRL 8; 0 = off, one
+// launch as before). GGML_CUDA_REPACK_MOE_TAIL=0/8/16 overrides it at run time.
+#ifndef GGML_RP_Q8_MOE_TAIL_BN
+#define GGML_RP_Q8_MOE_TAIL_BN 0
+#endif
 // MoE: use the 32-wide tile while n_assign < FACTOR * 128 * n_expert (64-wide otherwise)
 #ifndef GGML_RP_Q8_MOE_W32_FACTOR
 #define GGML_RP_Q8_MOE_W32_FACTOR 2
