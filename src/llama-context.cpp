@@ -1421,6 +1421,7 @@ float * llama_context::set_embeddings_pre_norm_accum(int32_t n_tokens_cap) {
         buf_pre_norm_accum.reset();
         embd_pre_norm_accum      = nullptr;
         embd_pre_norm_accum_size = 0;
+        embd_pre_norm_accum_active = false;
         return nullptr;
     }
 
@@ -1454,7 +1455,24 @@ float * llama_context::set_embeddings_pre_norm_accum(int32_t n_tokens_cap) {
     embd_pre_norm_accum      = (float *) ggml_backend_buffer_get_base(buf_pre_norm_accum.get());
     embd_pre_norm_accum_size = nfloats;
     embd_pre_norm_accum_ub   = 0;
+    embd_pre_norm_accum_active = true;
+    // Rows are [seq][pos]: each sequence gets its own n_ctx_seq rows when the KV cache is
+    // per-sequence, so concurrent prompts in different slots do not overwrite each other.
+    // A unified KV cache lets any sequence use the whole context, so it stays pos-indexed.
+    embd_pre_norm_accum_stride = !cparams.kv_unified && cparams.n_seq_max > 1 ?
+        (int64_t) n_ctx_seq() : (int64_t) n_tokens_cap;
     return embd_pre_norm_accum;
+}
+
+int64_t llama_context::get_embeddings_pre_norm_accum_stride() const {
+    return embd_pre_norm_accum ? embd_pre_norm_accum_stride : 0;
+}
+
+void llama_context::set_embeddings_pre_norm_accum_active(bool active) {
+    // Rows are only ever read back for positions extracted while active (the replay indexes
+    // the buffered chunk positions), so resuming needs no clear.
+    embd_pre_norm_accum_active = active && embd_pre_norm_accum != nullptr;
+    embd_pre_norm_accum_ub     = 0;
 }
 
 float * llama_context::get_embeddings_pre_norm_accum() {
@@ -2466,27 +2484,42 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 // and skip the per-batch embd_nextn copy, which is unused during prefill.
                 // Sequential positions use one D2H; unusual non-contiguous positions are
                 // copied row-by-row so replay indexes the actual positions safely.
-                const bool accum_active = embd_pre_norm_accum && !masked && ubatch.pos;
+                const bool accum_active = embd_pre_norm_accum && embd_pre_norm_accum_active && !masked &&
+                    ubatch.pos && ubatch.seq_id && ubatch.n_seq_id;
                 if (accum_active) {
-                    bool positions_valid = true;
-                    bool positions_contiguous = true;
+                    // row of token i: seq*stride + pos (stride == capacity for a single sequence)
+                    const int64_t stride = embd_pre_norm_accum_stride;
+                    auto row_of = [&](int64_t i) -> int64_t {
+                        if (ubatch.n_seq_id[i] != 1) {
+                            return -1;
+                        }
+                        const llama_pos    pos = ubatch.pos[i];
+                        const llama_seq_id seq = ubatch.seq_id[i][0];
+                        if (pos < 0 || pos >= stride || seq < 0) {
+                            return -1;
+                        }
+                        const int64_t row = (int64_t) seq * stride + pos;
+                        return ((size_t) row + 1) * n_embd <= embd_pre_norm_accum_size ? row : -1;
+                    };
+
+                    bool rows_valid      = true;
+                    bool rows_contiguous = true;
+                    const int64_t row0   = row_of(0);
                     for (int64_t i = 0; i < n_rows; ++i) {
-                        const llama_pos pos = ubatch.pos[i];
-                        positions_valid = positions_valid && pos >= 0 &&
-                            ((size_t) pos + 1) * n_embd <= embd_pre_norm_accum_size;
-                        positions_contiguous = positions_contiguous &&
-                            (i == 0 || pos == ubatch.pos[0] + i);
+                        const int64_t row = row_of(i);
+                        rows_valid      = rows_valid && row >= 0;
+                        rows_contiguous = rows_contiguous && row == row0 + i;
                     }
 
-                    if (positions_valid) {
-                        if (positions_contiguous) {
-                            float * dst = embd_pre_norm_accum + (size_t) ubatch.pos[0] * n_embd;
+                    if (rows_valid) {
+                        if (rows_contiguous) {
+                            float * dst = embd_pre_norm_accum + (size_t) row0 * n_embd;
                             ggml_backend_tensor_get_async(backend_h, t_h_nextn, dst, 0,
                                     n_rows * n_embd * sizeof(float));
                         } else {
                             const size_t row_bytes = (size_t) n_embd * sizeof(float);
                             for (int64_t i = 0; i < n_rows; ++i) {
-                                float * dst = embd_pre_norm_accum + (size_t) ubatch.pos[i] * n_embd;
+                                float * dst = embd_pre_norm_accum + (size_t) row_of(i) * n_embd;
                                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, dst,
                                         (size_t) i * row_bytes, row_bytes);
                             }
@@ -2502,12 +2535,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         // ring size: drain once every n_copies ubatches (vs the per-chunk synchronize
                         // that serialized the prefill and caused the MTP PP regression). This keeps
                         // the prefill pipelining within each ring-sized window.
-                        const int n_copies = ggml_backend_sched_get_n_copies(sched.get());
-                        if (n_copies > 1 && (++embd_pre_norm_accum_ub % n_copies) == 0) {
+                        // LLAMA_MTP_ACCUM_DRAIN_EVERY=N drains every N ubatches instead (0 = never);
+                        // a wrong setting shows up as lower MTP draft acceptance, not wrong output.
+                        static const int drain_every_env = []() {
+                            const char * env = getenv("LLAMA_MTP_ACCUM_DRAIN_EVERY");
+                            return env ? atoi(env) : -1;
+                        }();
+                        const int drain_every = drain_every_env >= 0 ? drain_every_env :
+                            ggml_backend_sched_get_n_copies(sched.get());
+                        if (drain_every > 1 && (++embd_pre_norm_accum_ub % drain_every) == 0) {
                             ggml_backend_sched_synchronize(sched.get());
                         }
                     }
-                } else {
+                }
+                // Always fill the per-batch rows too: with several slots, a batch can mix one
+                // slot's prompt (staged above) with another slot's generation, whose MTP hook
+                // reads these rows through the synchronizing getter.
+                {
                     float * embd_nextn_out = embd_nextn.data + offset*n_embd;
                     GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                     ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
@@ -4834,6 +4878,14 @@ float * llama_set_embeddings_pre_norm_accum(llama_context * ctx, int32_t n_token
 
 float * llama_get_embeddings_pre_norm_accum(llama_context * ctx) {
     return ctx->get_embeddings_pre_norm_accum();
+}
+
+void llama_set_embeddings_pre_norm_accum_active(llama_context * ctx, bool active) {
+    ctx->set_embeddings_pre_norm_accum_active(active);
+}
+
+int64_t llama_get_embeddings_pre_norm_accum_stride(const llama_context * ctx) {
+    return ctx->get_embeddings_pre_norm_accum_stride();
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
