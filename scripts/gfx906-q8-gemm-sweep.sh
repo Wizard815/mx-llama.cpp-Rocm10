@@ -11,10 +11,14 @@
 #   2. with MODEL set: llama-perplexity on a fixed text (must match the first
 #      candidate's PPL) and llama-bench prefill speed on the real model.
 #
-# Candidate = "dense_TN dense_NRL moe_TN moe_NRL moe_w32_factor"
+# Candidate = "dense_TN dense_NRL moe_TN moe_NRL moe_w32_factor [dense_MINB moe_MINB]"
 #   TN  = columns per thread (tile width = 64*TN dense, 32*TN MoE)
 #   NRL = row lanes per block (64/NRL rows per thread; 64/NRL must be a multiple of 4)
 #   factor: MoE uses the 32-wide tile while n_assign < factor*128*n_expert
+#           (inert for 256 experts below ~4096-token ubatches)
+#   MINB: blocks per CU the register budget must allow (default 2 dense, 3 MoE).
+#         A bigger tile at the default MINB spills; a lower MINB trades occupancy
+#         for registers instead.
 #
 #   scripts/gfx906-q8-gemm-sweep.sh                       # kernel stage only
 #   MODEL=/app/models/.../Tiel-Coder-...-noBF16.gguf scripts/gfx906-q8-gemm-sweep.sh
@@ -41,19 +45,18 @@ COMMON=(-m "$MODEL" -ngl 99 -sm layer -lm dio)
 if [ $# -gt 0 ]; then
     CANDIDATES=("$@")
 else
-    # First entry is the current default.
+    # First entry is the current default. The TN/NRL grid at the default MINB was
+    # swept already (all slower); these give the bigger tiles their registers back.
     CANDIDATES=(
-        "2 4 1 8 2"
-        "1 4 1 8 2"
-        "4 4 1 8 2"
-        "2 8 1 8 2"
-        "1 8 1 8 2"
-        "2 4 2 8 2"
-        "2 4 1 4 2"
-        "2 4 1 16 2"
-        "2 4 2 4 2"
-        "2 4 1 8 1"
-        "2 4 1 8 4"
+        "2 4 1 8 2 2 3"
+        "2 4 1 8 2 2 2"
+        "2 4 2 8 2 2 2"
+        "2 4 2 8 2 2 1"
+        "2 4 1 4 2 2 2"
+        "2 4 2 4 2 2 1"
+        "2 4 1 8 2 1 3"
+        "4 4 1 8 2 1 3"
+        "2 4 1 8 2 2 3"
     )
 fi
 
@@ -75,11 +78,12 @@ trap restore EXIT
 ppl_ref=""
 results=()
 for c in "${CANDIDATES[@]}"; do
-    read -r dtn dnrl mtn mnrl fac <<< "$c"
-    label="dense TN=$dtn NRL=$dnrl | moe TN=$mtn NRL=$mnrl factor=$fac"
+    read -r dtn dnrl mtn mnrl fac dmb mmb <<< "$c"
+    dmb=${dmb:-2}; mmb=${mmb:-3}
+    label="dense TN=$dtn NRL=$dnrl MINB=$dmb | moe TN=$mtn NRL=$mnrl MINB=$mmb factor=$fac"
     echo "=== $label"
-    printf '#pragma once\n#define GGML_RP_Q8_DENSE_TN %s\n#define GGML_RP_Q8_DENSE_NRL %s\n#define GGML_RP_Q8_MOE_W32_TN %s\n#define GGML_RP_Q8_MOE_W32_NRL %s\n#define GGML_RP_Q8_MOE_W32_FACTOR %s\n' \
-        "$dtn" "$dnrl" "$mtn" "$mnrl" "$fac" > "$TUNE"
+    printf '#pragma once\n#define GGML_RP_Q8_DENSE_TN %s\n#define GGML_RP_Q8_DENSE_NRL %s\n#define GGML_RP_Q8_MOE_W32_TN %s\n#define GGML_RP_Q8_MOE_W32_NRL %s\n#define GGML_RP_Q8_MOE_W32_FACTOR %s\n#define GGML_RP_Q8_DENSE_MINB %s\n#define GGML_RP_Q8_MOE_W32_MINB %s\n' \
+        "$dtn" "$dnrl" "$mtn" "$mnrl" "$fac" "$dmb" "$mmb" > "$TUNE"
 
     if ! cmake --build "$BUILD_DIR" --target "${TARGETS[@]}" -j"$(nproc)" > /tmp/q8-sweep-build.log 2>&1; then
         echo "    compile failed (see /tmp/q8-sweep-build.log)"

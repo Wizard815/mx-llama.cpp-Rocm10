@@ -3,7 +3,9 @@
 // Q8_0 repacked GEMM tile config on gfx906 (prefill), see mul-mat.cu (dense, >= 128
 // tokens) and mul-mat-id.cu (MoE, 32-wide path). TN = columns per thread (the tile
 // is CW*TN tokens wide), NRL = row lanes per block (each thread owns 64/NRL rows;
-// must leave 64/NRL a multiple of 4). Defaults are the previous hard-wired values;
+// must leave 64/NRL a multiple of 4), MINB = blocks per CU the kernel's register
+// budget must allow (lower lets a bigger tile keep its registers instead of
+// spilling). Defaults are the previous hard-wired values;
 // scripts/gfx906-q8-gemm-sweep.sh overrides them per candidate.
 #ifndef GGML_RP_Q8_DENSE_TN
 #define GGML_RP_Q8_DENSE_TN   MMQ_RP_Q8_TN          // 2
@@ -20,4 +22,10 @@
 // MoE: use the 32-wide tile while n_assign < FACTOR * 128 * n_expert (64-wide otherwise)
 #ifndef GGML_RP_Q8_MOE_W32_FACTOR
 #define GGML_RP_Q8_MOE_W32_FACTOR 2
+#endif
+#ifndef GGML_RP_Q8_DENSE_MINB
+#define GGML_RP_Q8_DENSE_MINB 2
+#endif
+#ifndef GGML_RP_Q8_MOE_W32_MINB
+#define GGML_RP_Q8_MOE_W32_MINB 3
 #endif

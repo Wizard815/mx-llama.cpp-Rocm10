@@ -230,7 +230,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                 ggml_cuda_pool_alloc<repack_tile_meta> tile_meta_q8(ctx.pool(), max_tiles_q8);
                 repack_tile_off<bn_q8><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off_q8.get(), tile_meta_q8.get(), ne02);
                 const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles_q8, 1);
-                mmq_gemm_repacked_w32<true, tn_q8, nrl_q8, GGML_TYPE_Q8_0><<<grid, dim3(32, nrl_q8), 0, stream>>>(
+                mmq_gemm_repacked_w32<true, tn_q8, nrl_q8, GGML_TYPE_Q8_0, GGML_RP_Q8_MOE_W32_MINB><<<grid, dim3(32, nrl_q8), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
                     ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_q8.get(), tile_meta_q8.get(),
                     (uint32_t) ne02, expert_stride, dst_s1);
