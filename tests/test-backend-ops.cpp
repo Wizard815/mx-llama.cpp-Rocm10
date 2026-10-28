@@ -11876,6 +11876,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
     // chunked path: multi-chunk and non-multiple-of-chunk-size (chunk_size=64 GDN, 16 KDA)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1));
+    // head size 128 on the chunked path (n_tokens >= 2*CS = 128), GQA-style v_repeat as in
+    // Qwen3.5/3.6-35B-A3B (16 key heads, 32 value heads); 200 is not a multiple of the chunk size.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 200, 2, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 256, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  65, 1));
@@ -12207,6 +12211,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
     }
 
+    // Qwen3.5/3.6-35B-A3B linear-attention prefill (16 key heads, 32 value heads, head size 128),
+    // the shape scripts/gfx906-gdn-sweep.sh tunes the chunked Gated DeltaNet kernel for.
+    for (int n_tokens : { 1024, 2048 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 2));
+    }
     // Qwen3.5/3.6-35B-A3B-style prefill (head size 256, 2 KV heads, GQA 8, ubatch 1024),
     // the shape scripts/gfx906-fattn-tile-sweep.sh tunes the tile kernel for.
     for (int kv : { 8192, 32768 }) {

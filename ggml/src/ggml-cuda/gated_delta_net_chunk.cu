@@ -1,4 +1,5 @@
 #include "gated_delta_net_chunk.cuh"
+#include "gated_delta_net-gcn-tune.h"
 #include "ggml-cuda/common.cuh"
 
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
@@ -67,7 +68,9 @@ static __device__ __forceinline__ float gdn_warp_reduce_sum(const float x) {
 // which makes it a long prefill a single kernel launch with no state round-trips.
 // CS = 64 for the non-KDA path and CS = 16 for the KDA (per-feature gate) path.
 
-template <int S_v, bool KDA, int CS, int Tc>
+// unroll_cols: unroll the per-column loop so the two warp reductions of different columns can
+// interleave (each column's reduce -> update -> reduce chain is otherwise serialized).
+template <int S_v, bool KDA, int CS, int Tc, bool unroll_cols = false>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_chunked_cuda(
         const float * __restrict__ q,
@@ -155,9 +158,11 @@ gated_delta_net_chunked_cuda(
             if constexpr (!KDA) {
                 const float g_val = expf(g[gb]);
 
-                for (int cc = 0; cc < Tc; cc++) {
+                auto col_step = [&](const int cc) {
                     const int col = base_col + cc;
-                    if (col >= S_v) break;
+                    if (col >= S_v) {
+                        return;
+                    }
                     const float v_col = v_t[col];
 
                     float kv_shard = 0.0f;
@@ -180,6 +185,17 @@ gated_delta_net_chunked_cuda(
 
                     if (lane == 0) {
                         attn_data[col] = attn_col * scale;
+                    }
+                };
+
+                if constexpr (unroll_cols) {
+                    #pragma unroll
+                    for (int cc = 0; cc < Tc; cc++) {
+                        col_step(cc);
+                    }
+                } else {
+                    for (int cc = 0; cc < Tc; cc++) {
+                        col_step(cc);
                     }
                 }
             } else {
@@ -253,7 +269,8 @@ void launch_gated_delta_net_chunk(
     const int device = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
     const int cc = ggml_cuda_info().devices[device].cc;
-    const int num_warps = cc == GGML_CUDA_CC_VEGA20 ? 2 : 4;
+    const bool gcn = cc == GGML_CUDA_CC_VEGA20;
+    const int num_warps = gcn ? 2 : 4;
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
@@ -291,6 +308,20 @@ void launch_gated_delta_net_chunk(
             break;
         }
         case 128: {
+            if (gcn) {
+                // gfx906: columns per warp, warps per block and column unrolling from
+                // gated_delta_net-gcn-tune.h (scripts/gfx906-gdn-sweep.sh).
+                constexpr int Tc = GGML_GDN_GCN_128_TC;
+                constexpr int nw = GGML_GDN_GCN_128_NWARPS;
+                const dim3 block_dims_gcn(warp_size <= S_v ? warp_size : S_v, nw, 1);
+                dim3 grid_dims(H, n_seqs, (S_v + nw * Tc - 1) / (nw * Tc));
+                const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid_dims, block_dims_gcn, 0, stream);
+                ggml_cuda_kernel_launch(gated_delta_net_chunked_cuda<128, KDA, KDA ? 16 : 64, Tc, GGML_GDN_GCN_128_UNROLL != 0>, lp,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                break;
+            }
             constexpr int Tc = 2;
             dim3 grid_dims(H, n_seqs, (S_v + num_warps * Tc - 1) / (num_warps * Tc));
             const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
