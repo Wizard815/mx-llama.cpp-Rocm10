@@ -53,10 +53,21 @@ static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const 
     const int64_t nmat = ne / (ne00 * ne01);
     const int64_t n = ne00 * ne01;
 
-    const int64_t x  = (int64_t) blockIdx.x * CUDA_CPY_TILE_DIM_2D + threadIdx.x;
-    const int64_t y  = (int64_t) blockIdx.y * CUDA_CPY_TILE_DIM_2D + threadIdx.y;
-    const int64_t tx = (int64_t) blockIdx.y * CUDA_CPY_TILE_DIM_2D + threadIdx.x;  // transpose block offset
-    const int64_t ty = (int64_t) blockIdx.x * CUDA_CPY_TILE_DIM_2D + threadIdx.y;
+    // Diagonal block order: with power-of-two row strides the default order makes concurrent
+    // blocks hit the same memory channels (~12x slower on gfx906 at 8192x2048). Bijective remap.
+    // Skinny grids already spread across channels and lose from it, so they keep the default order.
+    unsigned int bx = blockIdx.x;
+    unsigned int by = blockIdx.y;
+    if (gridDim.y >= 16) {
+        const unsigned int bid = blockIdx.x + gridDim.x*blockIdx.y;
+        by = bid % gridDim.y;
+        bx = (bid/gridDim.y + by) % gridDim.x;
+    }
+
+    const int64_t x  = (int64_t) bx * CUDA_CPY_TILE_DIM_2D + threadIdx.x;
+    const int64_t y  = (int64_t) by * CUDA_CPY_TILE_DIM_2D + threadIdx.y;
+    const int64_t tx = (int64_t) by * CUDA_CPY_TILE_DIM_2D + threadIdx.x;  // transpose block offset
+    const int64_t ty = (int64_t) bx * CUDA_CPY_TILE_DIM_2D + threadIdx.y;
 
     __shared__ float tile[2][CUDA_CPY_TILE_DIM_2D][CUDA_CPY_TILE_DIM_2D+1];
     int cur_tile_buf = 0;
