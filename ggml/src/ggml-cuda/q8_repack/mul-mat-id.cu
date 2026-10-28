@@ -8,6 +8,65 @@
 #include "../mmq.cuh"
 #include "../mmid.cuh"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+// GGML_CUDA_REPACK_TILE_STATS=1: how full the Q8_0 MoE prefill GEMM tiles are. Each
+// expert's tokens are cut into BN-wide tiles, so an expert with BN+1 tokens runs two
+// tiles; the padding is computed and thrown away. Reads expert_bounds back (a sync per
+// call, skipped while a graph is being captured: set GGML_CUDA_DISABLE_GRAPHS=1) and
+// prints a summary at exit. Diagnostic only.
+static std::atomic<uint64_t> g_tile_calls{0}, g_tile_assign{0}, g_tile_slots{0}, g_tile_tail_hist[5];
+static int g_tile_bn = 0;
+
+static void repack_tile_stats_dump() {
+    const uint64_t a = g_tile_assign.load(), sl = g_tile_slots.load();
+    if (sl == 0) {
+        return;
+    }
+    fprintf(stderr, "[repack-moe-tiles] BN=%d calls=%llu assignments=%llu tile slots=%llu fill=%.1f%%\n",
+        g_tile_bn, (unsigned long long) g_tile_calls.load(), (unsigned long long) a, (unsigned long long) sl, 100.0 * a / sl);
+    fprintf(stderr, "[repack-moe-tiles] expert tails (tokens in the last tile, BN quarters): none=%llu <=1/4=%llu <=1/2=%llu <=3/4=%llu more=%llu\n",
+        (unsigned long long) g_tile_tail_hist[0].load(), (unsigned long long) g_tile_tail_hist[1].load(),
+        (unsigned long long) g_tile_tail_hist[2].load(), (unsigned long long) g_tile_tail_hist[3].load(),
+        (unsigned long long) g_tile_tail_hist[4].load());
+}
+
+static void repack_tile_stats(const int32_t * expert_bounds_d, int64_t n_expert, int bn, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    static const bool enabled = getenv("GGML_CUDA_REPACK_TILE_STATS") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    hipStreamCaptureStatus cap = hipStreamCaptureStatusNone;
+    if (hipStreamIsCapturing(stream, &cap) != hipSuccess || cap != hipStreamCaptureStatusNone) {
+        return;
+    }
+    static std::atomic<bool> registered{false};
+    if (!registered.exchange(true)) {
+        atexit(repack_tile_stats_dump);
+    }
+    g_tile_bn = bn;
+    std::vector<int32_t> eb(n_expert + 1);
+    CUDA_CHECK(cudaMemcpyAsync(eb.data(), expert_bounds_d, eb.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    uint64_t slots = 0;
+    for (int64_t e = 0; e < n_expert; e++) {
+        const int cnt = eb[e + 1] - eb[e];
+        slots += (uint64_t) ((cnt + bn - 1) / bn) * bn;
+        const int tail = cnt % bn;
+        g_tile_tail_hist[cnt == 0 || tail == 0 ? 0 : 1 + (4 * tail - 1) / bn]++;
+    }
+    g_tile_calls++;
+    g_tile_assign += (uint64_t) (eb[n_expert] - eb[0]);
+    g_tile_slots  += slots;
+#else
+    GGML_UNUSED_VARS(expert_bounds_d, n_expert, bn, stream);
+#endif
+}
+
 void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         ggml_tensor * dst) {
@@ -235,6 +294,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
                     ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_q8.get(), tile_meta_q8.get(),
                     (uint32_t) ne02, expert_stride, dst_s1);
+                repack_tile_stats(expert_bounds.get(), ne02, bn_q8, stream);
             } else if (use_w32) {
                 const int64_t max_tiles_w32 = n_assign / BN_W32 + ne02;
                 ggml_cuda_pool_alloc<int32_t>          tile_off_w32 (ctx.pool(), ne02 + 1);
