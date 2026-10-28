@@ -17,8 +17,9 @@
 #   factor: MoE uses the 32-wide tile while n_assign < factor*128*n_expert
 #           (inert for 256 experts below ~4096-token ubatches)
 #   MINB: minimum waves per SIMD (__launch_bounds__ -> amdgpu_waves_per_eu), VGPR
-#         budget 256/MINB (default 2 dense = 128, 3 MoE = 84).
-#   moe_CW: MoE lanes per row of the block (default 32). CW 16 TN 2 or CW 8 TN 4
+#         budget 256/MINB (default 2). The compiler drops it when LDS already
+#         caps occupancy lower (the 64-thread MoE default runs 1 wave/SIMD).
+#   moe_CW: MoE lanes per row of the block (default 8). CW 16 TN 2 or CW 8 TN 4
 #         keep the 32-token tile (~ tokens per expert at -ub 1024 with 256
 #         experts) but reuse each LDS weight read across 2 / 4 tokens.
 #
@@ -47,18 +48,14 @@ COMMON=(-m "$MODEL" -ngl 99 -sm layer -lm dio)
 if [ $# -gt 0 ]; then
     CANDIDATES=("$@")
 else
-    # First and last entry are the current default (same-GPU drift check). TN/NRL
-    # and MINB at CW 32 were swept already (all slower); these keep the 32-token
-    # MoE tile and move work from lanes to tokens per thread.
+    # First and last entry are the current default (same-GPU drift check), then
+    # the old CW 32 / TN 1 MoE tile it replaced and the runners-up.
     CANDIDATES=(
-        "2 4 1 8 2 2 3 32"
-        "2 4 2 8 2 2 3 16"
-        "2 4 2 8 2 2 2 16"
-        "2 4 2 16 2 2 3 16"
-        "2 4 2 4 2 2 2 16"
         "2 4 4 8 2 2 2 8"
-        "2 4 4 16 2 2 2 8"
         "2 4 1 8 2 2 3 32"
+        "2 4 2 4 2 2 2 16"
+        "2 4 2 8 2 2 3 16"
+        "2 4 4 8 2 2 2 8"
     )
 fi
 
@@ -81,7 +78,7 @@ ppl_ref=""
 results=()
 for c in "${CANDIDATES[@]}"; do
     read -r dtn dnrl mtn mnrl fac dmb mmb mcw <<< "$c"
-    dmb=${dmb:-2}; mmb=${mmb:-3}; mcw=${mcw:-32}
+    dmb=${dmb:-2}; mmb=${mmb:-2}; mcw=${mcw:-8}
     label="dense TN=$dtn NRL=$dnrl MINB=$dmb | moe CW=$mcw TN=$mtn NRL=$mnrl MINB=$mmb factor=$fac"
     echo "=== $label"
     printf '#pragma once\n#define GGML_RP_Q8_DENSE_TN %s\n#define GGML_RP_Q8_DENSE_NRL %s\n#define GGML_RP_Q8_MOE_W32_TN %s\n#define GGML_RP_Q8_MOE_W32_NRL %s\n#define GGML_RP_Q8_MOE_W32_FACTOR %s\n#define GGML_RP_Q8_DENSE_MINB %s\n#define GGML_RP_Q8_MOE_W32_MINB %s\n#define GGML_RP_Q8_MOE_W32_CW %s\n' \
@@ -136,7 +133,7 @@ for c in "${CANDIDATES[@]}"; do
     pp=$(echo "$bench" | python3 -c '
 import csv, sys
 rows = list(csv.DictReader(sys.stdin))
-print(" ".join(f"pp{r[\"n_prompt\"]}={float(r[\"avg_ts\"]):.1f}" for r in rows))')
+print(" ".join("pp%s=%.1f" % (r["n_prompt"], float(r["avg_ts"])) for r in rows))')
     echo "    $pp t/s"
     results+=("$label | PPL $ppl ($pcheck) | $pp")
 done

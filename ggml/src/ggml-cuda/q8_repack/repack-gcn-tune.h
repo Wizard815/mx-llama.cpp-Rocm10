@@ -13,16 +13,21 @@
 #ifndef GGML_RP_Q8_DENSE_NRL
 #define GGML_RP_Q8_DENSE_NRL  MMQ_RP_Q8_NROW_LANES  // 4
 #endif
-// MoE lane width: the tile is CW*TN tokens and a thread owns 64/NRL rows x TN tokens,
-// so CW 16 / TN 2 keeps the 32-token tile while each LDS weight read feeds 2 tokens.
+// MoE lane width: the tile is CW*TN tokens and a thread owns 64/NRL rows x TN tokens.
+// gfx906 default CW 8 / TN 4 / NRL 8: the 32-token tile (~ tokens per expert at
+// -ub 1024, 256 experts) with each LDS weight read feeding 4 tokens instead of 1.
+// Against CW 32 / TN 1 (the old hard-wired tile) on Tiel-Coder-35B-A3B Q8_0, 2x MI50:
+// LDS wait / VALU active 1.27 -> 0.01, MoE up -6.5%, down -3.2%, pp2048 +2.1%,
+// pp8192 +1.9%, PPL identical. One-wave blocks at 14 KiB LDS run 1 wave/SIMD
+// whatever the VGPR count, so the compiler drops MINB here (196 VGPR, no spills).
 #ifndef GGML_RP_Q8_MOE_W32_CW
-#define GGML_RP_Q8_MOE_W32_CW  32
+#define GGML_RP_Q8_MOE_W32_CW  8
 #endif
 #ifndef GGML_RP_Q8_MOE_W32_TN
-#define GGML_RP_Q8_MOE_W32_TN  1
+#define GGML_RP_Q8_MOE_W32_TN  4
 #endif
 #ifndef GGML_RP_Q8_MOE_W32_NRL
-#define GGML_RP_Q8_MOE_W32_NRL (MMQ_RP_Q8_NROW_LANES * 2)  // 8
+#define GGML_RP_Q8_MOE_W32_NRL 8
 #endif
 // MoE: use the 32-wide tile while n_assign < FACTOR * 128 * n_expert (64-wide otherwise)
 #ifndef GGML_RP_Q8_MOE_W32_FACTOR
@@ -32,5 +37,5 @@
 #define GGML_RP_Q8_DENSE_MINB 2
 #endif
 #ifndef GGML_RP_Q8_MOE_W32_MINB
-#define GGML_RP_Q8_MOE_W32_MINB 3
+#define GGML_RP_Q8_MOE_W32_MINB 2
 #endif

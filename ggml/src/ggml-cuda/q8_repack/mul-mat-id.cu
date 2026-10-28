@@ -221,7 +221,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         case GGML_TYPE_MXFP4: {
             const bool is_mx = src0->type == GGML_TYPE_MXFP4;
             if (use_w32 && !is_mx) {
-                // Q8_0 tile from repack-gcn-tune.h (default CW 32, TN 1, NRL 8)
+                // Q8_0 tile from repack-gcn-tune.h (gfx906 default CW 8, TN 4, NRL 8)
                 constexpr int cw_q8  = GGML_RP_Q8_MOE_W32_CW;
                 constexpr int tn_q8  = GGML_RP_Q8_MOE_W32_TN;
                 constexpr int nrl_q8 = GGML_RP_Q8_MOE_W32_NRL;
