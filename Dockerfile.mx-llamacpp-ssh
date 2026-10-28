@@ -18,7 +18,8 @@ RUN echo "PATH=/opt/rocm/bin:/app:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/
 ENV PATH="/app:/opt/rocm/bin:$PATH"
 
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY serve.sh /usr/local/bin/serve
+RUN chmod +x /entrypoint.sh /usr/local/bin/serve
 
 EXPOSE 22
 
