@@ -27,4 +27,7 @@ if [ -d /etc/ssh/host-keys ]; then
     chmod 600 /etc/ssh/ssh_host_*_key
 fi
 
-exec /usr/sbin/sshd -D
+mkdir -p /app/logs
+
+# -e: sshd logs to stderr, i.e. the docker log stream; there is no syslogd here
+exec /usr/sbin/sshd -D -e
