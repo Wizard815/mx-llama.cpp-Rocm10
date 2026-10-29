@@ -27,6 +27,8 @@ services:
     group_add:
       - video
       - "18"
+    # RCCL's shared-memory transport needs more than the 64 MB default /dev/shm.
+    shm_size: 16gb
     volumes:
       - ${ODYSSEUS_SSH_KEY:?set ODYSSEUS_SSH_KEY in .env}:/run/secrets/authorized_key:ro
       - ${MODELS_DIR:?set MODELS_DIR in .env}:/app/models
@@ -42,6 +44,10 @@ services:
 
     environment:
      - HUGGINGFACE_HUB_CACHE=/app/models/HFCache/hub
+     # Tensor split on the P2P kernel: fine-grained PCIe memory lets llama.cpp's own
+     # AllReduce write straight into the peer GPU; RCCL would pick its slower SHM path.
+     - HSA_FORCE_FINE_GRAIN_PCIE=1
+     - GGML_CUDA_ALLREDUCE=internal
     networks:
 #      - default
       - ai_net
