@@ -1294,6 +1294,12 @@ static bool ggml_backend_cuda_comm_allreduce_custom_prepare(
         eligible = (n_backends <= 2 && ne < 32768) ||
                    (n_backends == 3 && ne < 131072) ||
                    (n_backends >= 4 && ne < 262144);
+        // With BF16 on the wire the broadcast kernel sends what NCCL's BF16 ring
+        // sends, over direct peer writes, so large messages stay on it too.
+        const int64_t bf16_min_ne = ggml_cuda_tp::tp_custom_ar_bf16_min_ne();
+        if (!eligible && comm_ctx->custom_ar.broadcast_ok && bf16_min_ne > 0 && ne >= bf16_min_ne) {
+            eligible = true;
+        }
     }
     if (!eligible) {
         return false;

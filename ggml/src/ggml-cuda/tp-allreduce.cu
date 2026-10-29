@@ -1,5 +1,6 @@
 #include "tp-allreduce.cuh"
 
+#include <algorithm>
 #include <type_traits>
 
 #if defined(GGML_USE_HIP)
@@ -284,7 +285,21 @@ k_cross_device_reduce_1stage(
 __device__ unsigned long long g_ar_ktime[5] = {0, 0, 0, 0, 0};
 __device__ int                g_ar_ktime_on = 0;
 
-template <int NRANKS>
+// BF16 on the wire (WIRE_BF16): each rank rounds its F32 partial to BF16 (round to
+// nearest even) before the peer write, and reduces the BF16 values back in F32. The
+// self contribution is rounded the same way, so every rank sums identical values in
+// the same order and the ranks stay bit-identical. Halves the PCIe bytes per AR; used
+// only for prefill-sized messages (GGML_TP_AR_BF16_MIN_NE), decode stays F32.
+static __device__ __forceinline__ uint32_t ar_bf16_bits(const float f) {
+    uint32_t u = __float_as_uint(f);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return u >> 16;
+}
+static __device__ __forceinline__ float ar_bf16_lo(const uint32_t w) { return __uint_as_float(w << 16); }
+static __device__ __forceinline__ float ar_bf16_hi(const uint32_t w) { return __uint_as_float(w & 0xFFFF0000u); }
+static __device__ __forceinline__ float ar_bf16_round(const float f) { return __uint_as_float(ar_bf16_bits(f) << 16); }
+
+template <int NRANKS, bool WIRE_BF16 = false>
 __global__ void __launch_bounds__(kThreads, 1)
 k_broadcast_reduce(
         RankData * __restrict__ _dp,        // peer (and self) staging pointers
@@ -315,6 +330,17 @@ k_broadcast_reduce(
          idx < n_float4;
          idx += (int64_t)gridDim.x * blockDim.x) {
         const float4 v = ((const float4 *) input)[idx];
+        if constexpr (WIRE_BF16) {
+            const uint2 w = make_uint2(ar_bf16_bits(v.x) | (ar_bf16_bits(v.y) << 16),
+                                       ar_bf16_bits(v.z) | (ar_bf16_bits(v.w) << 16));
+#pragma unroll
+            for (int r = 0; r < NRANKS; r++) {
+                if (r == rank) continue;
+                uint16_t * dst = ((uint16_t *)(uintptr_t)dp.ptrs[r]) + rank_offset + idx * 4;
+                *((uint2 *) dst) = w;
+            }
+            continue;
+        }
 #pragma unroll
         for (int r = 0; r < NRANKS; r++) {
             if (r == rank) continue;   // self-slot is NOT peer-written; read `input` directly in phase 2
@@ -330,7 +356,11 @@ k_broadcast_reduce(
 #pragma unroll
         for (int r = 0; r < NRANKS; r++) {
             if (r == rank) continue;
-            ((float *)(uintptr_t)dp.ptrs[r])[rank_offset + idx] = v;
+            if constexpr (WIRE_BF16) {
+                ((uint16_t *)(uintptr_t)dp.ptrs[r])[rank_offset + idx] = (uint16_t) ar_bf16_bits(v);
+            } else {
+                ((float *)(uintptr_t)dp.ptrs[r])[rank_offset + idx] = v;
+            }
         }
     }
 
@@ -367,7 +397,22 @@ k_broadcast_reduce(
 #pragma unroll
         for (int r = 0; r < NRANKS; r++) {
             float4 v;
-            if (r == rank) {
+            if constexpr (WIRE_BF16) {
+                if (r == rank) {
+                    v = ((const float4 *) input)[idx];
+                    v = make_float4(ar_bf16_round(v.x), ar_bf16_round(v.y), ar_bf16_round(v.z), ar_bf16_round(v.w));
+                } else {
+                    const uint32_t * base = (const uint32_t *) ((const uint16_t *) local_staging + (int64_t)r * n_elements + idx * 4);
+#if defined(GGML_USE_HIP)
+                    const uint32_t w0 = __builtin_nontemporal_load(base + 0);
+                    const uint32_t w1 = __builtin_nontemporal_load(base + 1);
+#else
+                    const uint32_t w0 = base[0];
+                    const uint32_t w1 = base[1];
+#endif
+                    v = make_float4(ar_bf16_lo(w0), ar_bf16_hi(w0), ar_bf16_lo(w1), ar_bf16_hi(w1));
+                }
+            } else if (r == rank) {
                 v = ((const float4 *) input)[idx];   // self contribution
             } else {
                 const float * base = local_staging + (int64_t)r * n_elements + idx * 4;
@@ -394,7 +439,10 @@ k_broadcast_reduce(
 #pragma unroll
         for (int r = 0; r < NRANKS; r++) {
             float v;
-            if (r == rank) {
+            if constexpr (WIRE_BF16) {
+                v = r == rank ? ar_bf16_round(input[idx])
+                              : __uint_as_float((uint32_t) ((const uint16_t *) local_staging)[(int64_t)r * n_elements + idx] << 16);
+            } else if (r == rank) {
                 v = input[idx];
             } else {
                 const float * base = local_staging + (int64_t)r * n_elements + idx;
@@ -772,6 +820,14 @@ void tp_custom_ar_destroy(CustomARContext * ctx) {
     ctx->initialized = false;
 }
 
+int64_t tp_custom_ar_bf16_min_ne() {
+    static const int64_t v = []{
+        const char * e = getenv("GGML_TP_AR_BF16_MIN_NE");
+        return e != nullptr ? std::max<int64_t>(0, (int64_t) strtoll(e, nullptr, 10)) : (int64_t) 0;
+    }();
+    return v;
+}
+
 bool tp_custom_ar_prepare(CustomARContext * ctx,
                           float ** input_ptrs,
                           float ** output_ptrs,
@@ -965,6 +1021,11 @@ bool tp_custom_ar_prepare(CustomARContext * ctx,
     plan->blocks     = blocks;
     plan->twoshot    = s_twoshot;
     plan->broadcast  = s_broadcast;
+    // BF16 wire only on the broadcast path, for messages at or above the threshold
+    // (uint2 peer writes need n_elements % 4 == 0 so every rank's slot stays 8-byte aligned).
+    const int64_t bf16_min_ne = tp_custom_ar_bf16_min_ne();
+    plan->wire_bf16  = s_broadcast && !s_twoshot && bf16_min_ne > 0 &&
+                       n_elements >= bf16_min_ne && (n_elements % 4) == 0;
     // The allgather region starts at half the staging allocation, above the scatter region of every call the allocation can serve.
     plan->ag_offset  = (int64_t) (ctx->staging_size / sizeof(float) / 2) & ~(int64_t) 3;
     GGML_ASSERT(!s_twoshot || plan->ag_offset >= n_elements);
@@ -1009,6 +1070,10 @@ void tp_custom_ar_launch_rank(const CustomARPlan * plan, int rank) {
                 k_twoshot_f32<N><<<blocks, kThreads, 0, plan->streams[rank]>>>(
                     ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
                     plan->inputs[rank], plan->outputs[rank], rank, n_elements, plan->ag_offset);
+            } else if (plan->wire_bf16) {
+                k_broadcast_reduce<N, true><<<blocks, kThreads, 0, plan->streams[rank]>>>(
+                    ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
+                    plan->inputs[rank], plan->outputs[rank], rank, n_elements);
             } else {
                 k_broadcast_reduce<N><<<blocks, kThreads, 0, plan->streams[rank]>>>(
                     ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
