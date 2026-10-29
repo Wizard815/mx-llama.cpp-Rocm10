@@ -20,3 +20,6 @@ models/*
 arm_neon.h
 compile_commands.json
 Dockerfile
+
+# Local source trees and builds for the container's dev mounts (docker-compose.dev.yml)
+container-src/
