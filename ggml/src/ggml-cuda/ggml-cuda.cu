@@ -1288,7 +1288,18 @@ static bool ggml_backend_cuda_comm_allreduce_custom_prepare(
         return false;
     }
     bool eligible = true;
-    if (s_gate_on && s_have_nccl) {
+    // The size gate hands large messages to NCCL, so it only applies while NCCL is
+    // the backend AllReduce. When RCCL is off or failed its probe (GGML_CUDA_ALLREDUCE=
+    // internal, or the fallback), the alternative is the internal AR, which stages
+    // through pinned host memory in two hops; with peer-write broadcast available the
+    // custom path is faster at every size (2x MI50, PCIe 3.0 P2P: tensor-split pp2048
+    // +5%, pp8192 +9%, decode and PPL unchanged).
+#ifdef GGML_USE_NCCL
+    const bool on_nccl = !comm_ctx->comms.empty();
+#else
+    const bool on_nccl = false;
+#endif
+    if (s_gate_on && s_have_nccl && (on_nccl || !comm_ctx->custom_ar.broadcast_ok)) {
         // Small-vs-large threshold from upstream's NCCL heuristic. Below this,
         // broadcast wins on TG by 14-30%; above this, NCCL BF16 ring is faster.
         eligible = (n_backends <= 2 && ne < 32768) ||
