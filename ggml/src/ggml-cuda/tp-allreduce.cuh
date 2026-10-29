@@ -195,7 +195,12 @@ struct CustomARPlan {
     int               blocks     = 0;
     bool              twoshot    = false;
     bool              broadcast  = false;
+    bool              wire_bf16  = false;   // broadcast with BF16 peer writes, see k_broadcast_reduce
 };
+
+// GGML_TP_AR_BF16_MIN_NE: messages of at least this many elements take the broadcast
+// kernel with BF16 on the wire (half the PCIe bytes); 0 / unset = off, F32 everywhere.
+int64_t tp_custom_ar_bf16_min_ne();
 
 // Returns false when the staging allocation cannot be satisfied. No kernels
 // are launched in that case, so the caller can use its normal AllReduce path.
