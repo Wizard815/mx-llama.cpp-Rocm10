@@ -12124,6 +12124,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Qwen3.5/3.6-35B-A3B (16 key heads, 32 value heads); 200 is not a multiple of the chunk size.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 200, 2, 2));
+    // chunked path with snapshot slots (K > 1) and several sequences, as in a multi-slot
+    // speculative prefill: per-seq input state and the last K per-token snapshots
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 2, 2, false, false, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 200, 3, 2, false, false, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  130, 2, 1, false, false, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   40, 2, 1, false, true,  4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 256, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  65, 1));
