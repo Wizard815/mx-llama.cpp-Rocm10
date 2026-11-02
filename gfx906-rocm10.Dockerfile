@@ -11,6 +11,12 @@ FROM ${BASE_IMAGE}
 # either value runs on MI50/MI60.
 ARG AMDGPU_TARGETS=gfx906
 ARG HIP_FLAGS="-mllvm -amdgpu-sched-strategy=max-ilp"
+# KV cache types with a compiled FlashAttention vector kernel (decode). A type
+# missing here still works, but every decode step first converts the whole KV
+# cache to f16 ("no FlashAttention vector kernel compiled for K/V types ...").
+# Upstream's default plus q5_0, for -ctk/-ctv q5_0; the turbo types are always
+# compiled by ggml-hip. Set GFX906_FA_QUANTS in .env to change it.
+ARG FA_QUANTS="q4_0-q4_0;q5_0-q5_0;q8_0-q8_0;f16-f16;bf16-bf16"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake ninja-build git libssl-dev libgomp1 curl ca-certificates \
@@ -25,6 +31,7 @@ RUN HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
       -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" -DCMAKE_BUILD_TYPE=Release -DHIP_COMPILER=clang \
       -DCMAKE_CXX_FLAGS="-O3 -Wno-unused-command-line-argument" \
       -DCMAKE_HIP_FLAGS="${HIP_FLAGS}" \
+      -DGGML_CUDA_FA_QUANTS="${FA_QUANTS}" \
       -DLLAMA_BUILD_TESTS=OFF \
     && cmake --build build --config Release -j"$(nproc)" \
     && mkdir -p /app \

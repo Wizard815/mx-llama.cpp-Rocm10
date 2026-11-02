@@ -12,6 +12,7 @@ services:
         BASE_IMAGE: ${GFX906_BASE_IMAGE:-zenth815/mx-llama-rocm10-gfx906:latest}
         AMDGPU_TARGETS: ${GFX906_AMDGPU_TARGETS:-gfx906}
         HIP_FLAGS: ${GFX906_HIP_FLAGS:--mllvm -amdgpu-sched-strategy=max-ilp}
+        FA_QUANTS: ${GFX906_FA_QUANTS:-q4_0-q4_0;q5_0-q5_0;q8_0-q8_0;f16-f16;bf16-bf16}
     image: mx-llama-rocm10-gfx906:local
 
   mx-llamacpp-ssh:
