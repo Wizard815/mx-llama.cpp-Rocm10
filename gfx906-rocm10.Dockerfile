@@ -14,9 +14,10 @@ ARG HIP_FLAGS="-mllvm -amdgpu-sched-strategy=max-ilp"
 # KV cache types with a compiled FlashAttention vector kernel (decode). A type
 # missing here still works, but every decode step first converts the whole KV
 # cache to f16 ("no FlashAttention vector kernel compiled for K/V types ...").
-# Upstream's default plus q5_0, for -ctk/-ctv q5_0; the turbo types are always
+# Every K/V pair of f16, q8_0, q5_0 and q4_0 (so -ctk and -ctv can differ, e.g.
+# q8_0 keys with q5_0 values) plus bf16/bf16. The same-type turbo pairs are always
 # compiled by ggml-hip. Set GFX906_FA_QUANTS in .env to change it.
-ARG FA_QUANTS="q4_0-q4_0;q5_0-q5_0;q8_0-q8_0;f16-f16;bf16-bf16"
+ARG FA_QUANTS="f16-f16;f16-q8_0;f16-q5_0;f16-q4_0;q8_0-f16;q8_0-q8_0;q8_0-q5_0;q8_0-q4_0;q5_0-f16;q5_0-q8_0;q5_0-q5_0;q5_0-q4_0;q4_0-f16;q4_0-q8_0;q4_0-q5_0;q4_0-q4_0;bf16-bf16"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake ninja-build git libssl-dev libgomp1 curl ca-certificates \
