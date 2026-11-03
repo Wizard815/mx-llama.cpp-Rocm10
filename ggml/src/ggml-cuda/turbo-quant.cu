@@ -19,6 +19,8 @@
 
 #include "common.cuh"
 #include "ggml-common.h"
+#include "convert.cuh"
+#include "turbo56.cuh"
 #ifdef GGML_USE_HIP
 #include <hip/hip_fp16.h>
 #else
@@ -956,6 +958,215 @@ void ggml_cuda_op_set_rows_turbo2(
     kernel_set_rows_turbo2<<<grid, block, 0, ctx.stream()>>>(
         src0_d, src1_d, dst_d, ne00, ne01, nb01, nb1, n_groups_per_row, is_v);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  turbo5 / turbo6 — 5/6-bit PolarQuant with FWHT rotation, no QJL
+//  Same shape as kernel_set_rows_turbo4: one thread per 128-element group
+//  (= one block), no cross-lane shuffles, so it is the same on wave32 and wave64.
+// ═══════════════════════════════════════════════════════════════════════
+
+template <int n_c>
+static __device__ __forceinline__ int turbo56_nearest(const float * c, const float val) {
+    int lo = 0;
+    int hi = n_c - 1;
+#pragma unroll
+    for (int step = 0; step < (n_c == 64 ? 6 : 5); ++step) {
+        const int mid = (lo + hi) / 2;
+        if (val < 0.5f*(c[mid] + c[mid + 1])) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return lo;
+}
+
+template <typename block_t, typename idx_t>
+__launch_bounds__(32, 1)
+static __global__ void kernel_set_rows_turbo56(
+    const float * __restrict__ src0, const idx_t * __restrict__ src1, char * __restrict__ dst,
+    const int64_t ne01, const int64_t ne02, const int64_t ne03,
+    const int64_t nb01, const int64_t nb02, const int64_t nb03,
+    const int64_t ne11, const int64_t ne12,
+    const int64_t nb10, const int64_t nb11, const int64_t nb12,
+    const int64_t nb1, const int64_t nb2, const int64_t nb3,
+    const int n_groups_per_row, const int use_v_signs) {
+
+    constexpr bool is6 = std::is_same_v<block_t, block_turbo6_0>;
+    constexpr int  n_c = is6 ? 64 : 32;
+    const float * C = is6 ? TURBO6_CENTROIDS : TURBO5_CENTROIDS;
+
+    const float * wht_signs1 = use_v_signs ? d_turbo_wht_signs1_v : d_turbo_wht_signs1;
+    const float * wht_signs2 = use_v_signs ? d_turbo_wht_signs2_v : d_turbo_wht_signs2;
+
+    const int64_t row = blockIdx.x; // flat over (i01, i02, i03)
+    if (row >= ne01*ne02*ne03) return;
+    const int grp_idx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (grp_idx >= n_groups_per_row) return;
+
+    const int64_t i01 = row % ne01;
+    const int64_t i02 = (row / ne01) % ne02;
+    const int64_t i03 = row / (ne01*ne02);
+
+    const idx_t dst_row = *(const idx_t *) ((const char *) src1 + i01*nb10 + (i02 % ne11)*nb11 + (i03 % ne12)*nb12);
+
+    const float * grp_src = (const float *) ((const char *) src0 + i01*nb01 + i02*nb02 + i03*nb03) + grp_idx*128;
+    block_t * blk = (block_t *) (dst + (int64_t) dst_row*nb1 + i02*nb2 + i03*nb3) + grp_idx;
+
+    float norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) norm_sq += grp_src[j] * grp_src[j];
+    const float norm     = sqrtf(norm_sq);
+    const float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+
+    float x[128];
+    for (int j = 0; j < 128; j++) x[j] = grp_src[j] * inv_norm * wht_signs1[j];
+    turbo_fwht_128(x);
+    for (int j = 0; j < 128; j++) x[j] *= wht_signs2[j];
+
+    for (int j = 0; j < 128/2; j++) blk->qs[j] = 0;
+    for (int j = 0; j < (is6 ? 128/4 : 128/8); j++) blk->qh[j] = 0;
+
+    float recon_norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) {
+        const int idx = turbo56_nearest<n_c>(C, x[j]);
+        recon_norm_sq += C[idx] * C[idx];
+        if constexpr (is6) {
+            blk->qs[j / 2] |= (uint8_t) ((idx & 0xF) << ((j % 2) * 4));
+            blk->qh[j / 4] |= (uint8_t) (((idx >> 4) & 0x3) << ((j % 4) * 2));
+        } else {
+            const int neg = idx < 16;
+            const int mag = neg ? 15 - idx : idx - 16;
+            blk->qs[j / 2] |= (uint8_t) (mag << ((j % 2) * 4));
+            blk->qh[j / 8] |= (uint8_t) (neg << (j % 8));
+        }
+    }
+
+    const float recon_norm = sqrtf(recon_norm_sq);
+    blk->norm = __float2half(recon_norm > 1e-10f ? norm / recon_norm : norm);
+}
+
+template <typename block_t>
+static void ggml_cuda_op_set_rows_turbo56(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->ne[0] % 128 == 0);
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+
+    const int n_groups_per_row = src0->ne[0] / 128;
+    const int64_t n_rows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    if (n_rows == 0) {
+        return;
+    }
+
+    const int threads    = 32;
+    const int grp_blocks = (n_groups_per_row + threads - 1) / threads;
+    const dim3 grid((unsigned) n_rows, grp_blocks);
+    const dim3 block(threads);
+
+    const int is_v = turbo_is_v_tensor(dst) ? 1 : 0;
+
+#define TURBO56_LAUNCH(idx_t)                                                                     \
+    kernel_set_rows_turbo56<block_t, idx_t><<<grid, block, 0, ctx.stream()>>>(                    \
+        (const float *) src0->data, (const idx_t *) src1->data, (char *) dst->data,               \
+        src0->ne[1], src0->ne[2], src0->ne[3], src0->nb[1], src0->nb[2], src0->nb[3],              \
+        src1->ne[1], src1->ne[2], src1->nb[0], src1->nb[1], src1->nb[2],                          \
+        dst->nb[1], dst->nb[2], dst->nb[3], n_groups_per_row, is_v)
+
+    if (src1->type == GGML_TYPE_I64) {
+        TURBO56_LAUNCH(int64_t);
+    } else {
+        GGML_ASSERT(src1->type == GGML_TYPE_I32);
+        TURBO56_LAUNCH(int32_t);
+    }
+#undef TURBO56_LAUNCH
+}
+
+void ggml_cuda_op_set_rows_turbo5(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_set_rows_turbo56<block_turbo5_0>(ctx, dst);
+}
+
+void ggml_cuda_op_set_rows_turbo6(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_set_rows_turbo56<block_turbo6_0>(ctx, dst);
+}
+
+// turbo5 / turbo6 dequantize (convert.cu tables, FA f16 fallback). Output stays in the rotated domain.
+template <typename block_t>
+static __device__ __forceinline__ float turbo56_dequant(const block_t * x, const int j) {
+    if constexpr (std::is_same_v<block_t, block_turbo6_0>) {
+        return TURBO6_CENTROIDS[turbo6_code(x, j)] * __half2float(x->norm);
+    } else {
+        return TURBO5_CENTROIDS[turbo5_code(x, j)] * __half2float(x->norm);
+    }
+}
+
+template <typename block_t, typename dst_t>
+static __global__ void dequantize_block_turbo56_kernel(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) return;
+    const block_t * x = (const block_t *) vx + i / 128;
+    y[i] = ggml_cuda_cast<dst_t>(turbo56_dequant(x, (int) (i % 128)));
+}
+
+template <typename block_t, typename dst_t>
+static __global__ void dequantize_block_turbo56_nc_kernel(
+    const void * __restrict__ vx, dst_t * __restrict__ y,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+    const int64_t s01, const int64_t s02, const int64_t s03) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ne00 * ne01 * ne02 * ne03) return;
+
+    const int64_t i03 = i / (ne00 * ne01 * ne02);
+    const int64_t i02 = (i / (ne00 * ne01)) % ne02;
+    const int64_t i01 = (i / ne00) % ne01;
+    const int64_t i00 = i % ne00;
+
+    // s01/s02/s03 are strides in blocks (nb / type_size)
+    const block_t * x = (const block_t *) vx + i01*s01 + i02*s02 + i03*s03 + i00 / 128;
+    y[i] = ggml_cuda_cast<dst_t>(turbo56_dequant(x, (int) (i00 % 128)));
+}
+
+template <typename block_t, typename dst_t>
+static void dequantize_row_turbo56_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int threads = 256;
+    const int64_t blocks = (k + threads - 1) / threads;
+    dequantize_block_turbo56_kernel<block_t, dst_t><<<blocks, threads, 0, stream>>>(vx, y, k);
+}
+
+template <typename block_t, typename dst_t>
+static void dequantize_row_turbo56_nc_cuda(const void * vx, dst_t * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
+    const int threads = 256;
+    const int64_t blocks = (ne00*ne01*ne02*ne03 + threads - 1) / threads;
+    dequantize_block_turbo56_nc_kernel<block_t, dst_t><<<blocks, threads, 0, stream>>>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03);
+}
+
+#define TURBO56_DEQUANT_FUNCS(name, block_t)                                                                       \
+    void dequantize_row_##name##_fp16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {           \
+        dequantize_row_turbo56_cuda<block_t>(vx, y, k, stream);                                                    \
+    }                                                                                                              \
+    void dequantize_row_##name##_fp32_cuda(const void * vx, float * y, int64_t k, cudaStream_t stream) {          \
+        dequantize_row_turbo56_cuda<block_t>(vx, y, k, stream);                                                    \
+    }                                                                                                              \
+    void dequantize_row_##name##_fp16_nc_cuda(const void * vx, half * y, int64_t ne00, int64_t ne01,              \
+            int64_t ne02, int64_t ne03, int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream) {              \
+        dequantize_row_turbo56_nc_cuda<block_t>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);             \
+    }                                                                                                              \
+    void dequantize_row_##name##_bf16_nc_cuda(const void * vx, nv_bfloat16 * y, int64_t ne00, int64_t ne01,       \
+            int64_t ne02, int64_t ne03, int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream) {              \
+        dequantize_row_turbo56_nc_cuda<block_t>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);             \
+    }                                                                                                              \
+    void dequantize_row_##name##_fp32_nc_cuda(const void * vx, float * y, int64_t ne00, int64_t ne01,             \
+            int64_t ne02, int64_t ne03, int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream) {              \
+        dequantize_row_turbo56_nc_cuda<block_t>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);             \
+    }
+
+TURBO56_DEQUANT_FUNCS(turbo5_0, block_turbo5_0)
+TURBO56_DEQUANT_FUNCS(turbo6_0, block_turbo6_0)
+
+#undef TURBO56_DEQUANT_FUNCS
 
 void ggml_cuda_op_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];

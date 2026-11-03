@@ -313,6 +313,7 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
+    llama_build_and_test(test-turbo-kv-rotation.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
 endif()
 

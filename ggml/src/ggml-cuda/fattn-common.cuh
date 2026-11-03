@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "turbo56.cuh"
 
 #include <cstdint>
 
@@ -977,6 +978,99 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(
     }
 }
 
+// ── TurboQuant 5/6-bit (turbo5/turbo6): FA KQ dot product ──
+// Same loop structure and Q_v indexing as vec_dot_fattn_vec_KQ_f16. Each k_KQ covers the value
+// pair (2*k_KQ, 2*k_KQ+1), which shares one qs byte. Centroids come from the __constant__ tables:
+// as K types these are not the recommended configuration, so this path is kept simple.
+template <ggml_type type_K, int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo56(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int k_KQ  = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
+            const int elem0 = k_KQ * 2;
+            const int ib    = elem0 / 128;
+            const int j0    = elem0 % 128;
+
+            float2 kv;
+            if constexpr (type_K == GGML_TYPE_TURBO6_0) {
+                const block_turbo6_0 * K_b = (const block_turbo6_0 *) K_c + ib;
+                const float norm = __half2float(K_b->norm);
+                kv.x = TURBO6_CENTROIDS[turbo6_code(K_b, j0 + 0)] * norm;
+                kv.y = TURBO6_CENTROIDS[turbo6_code(K_b, j0 + 1)] * norm;
+            } else {
+                const block_turbo5_0 * K_b = (const block_turbo5_0 *) K_c + ib;
+                const float norm = __half2float(K_b->norm);
+                kv.x = TURBO5_CENTROIDS[turbo5_code(K_b, j0 + 0)] * norm;
+                kv.y = TURBO5_CENTROIDS[turbo5_code(K_b, j0 + 1)] * norm;
+            }
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            ggml_cuda_mad(sum, kv, __half22float2(qv));
+#else
+            const float2 qv = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            sum += kv.x * qv.x + kv.y * qv.y;
+#endif // V_DOT2_F32_F16_AVAILABLE
+        }
+    }
+
+    return sum;
+}
+
+// ── TurboQuant 5/6-bit: FA V dequantize (generic) ──
+// flash_attn_ext_vec decodes turbo5/turbo6 V through a shared-memory centroid table instead
+// (see V_is_turbo56 there); this is the generic per-element path for any other caller.
+template <ggml_type type_V, typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo56(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const int64_t ib = i0 / 128;
+    const int     j0 = (int) (i0 % 128);
+
+    float vals[ne];
+    if constexpr (type_V == GGML_TYPE_TURBO6_0) {
+        const block_turbo6_0 * x = (const block_turbo6_0 *) vx + ib;
+        const float norm = __half2float(x->norm);
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            vals[l] = TURBO6_CENTROIDS[turbo6_code(x, j0 + l)] * norm;
+        }
+    } else {
+        const block_turbo5_0 * x = (const block_turbo5_0 *) vx + ib;
+        const float norm = __half2float(x->norm);
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            vals[l] = TURBO5_CENTROIDS[turbo5_code(x, j0 + l)] * norm;
+        }
+    }
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int l = 0; l < ne/2; ++l) {
+            ((half2 *) dst)[l] = make_half2(__float2half(vals[2*l]), __float2half(vals[2*l + 1]));
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = vals[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -987,6 +1081,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_turbo3_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
         return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO5_0 || type_K == GGML_TYPE_TURBO6_0) {
+        return vec_dot_fattn_vec_KQ_turbo56<type_K, D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_1) {
@@ -1015,6 +1111,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_turbo3_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
         return dequantize_V_turbo4_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO5_0 || type_V == GGML_TYPE_TURBO6_0) {
+        return dequantize_V_turbo56<type_V, T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q4_0) {
         return dequantize_V_q4_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q4_1) {

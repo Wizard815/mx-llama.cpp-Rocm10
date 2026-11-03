@@ -5628,6 +5628,24 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I64:
             // nothing to validate
             break;
+        case GGML_TYPE_TURBO5_0:
+            {
+                const block_turbo5_0 * q = (const block_turbo5_0 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].norm, i)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_TURBO6_0:
+            {
+                const block_turbo6_0 * q = (const block_turbo6_0 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].norm, i)) {
+                        return false;
+                    }
+                }
+            } break;
         default:
             {
                 fprintf(stderr, "%s: invalid type %d\n", __func__, type);

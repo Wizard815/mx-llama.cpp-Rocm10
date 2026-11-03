@@ -714,6 +714,19 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case_turbo(const ggml_tensor * Q
     FATTN_VEC_CASES_ALL_D_TURBO(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D_TURBO(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D_TURBO(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    // turbo5/turbo6: 128-value blocks, so D=128/256 only
+    FATTN_VEC_CASE_TURBO(128, GGML_TYPE_Q8_0,     GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE_TURBO(256, GGML_TYPE_Q8_0,     GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE_TURBO(128, GGML_TYPE_Q8_0,     GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE_TURBO(256, GGML_TYPE_Q8_0,     GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE_TURBO(128, GGML_TYPE_F16,      GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE_TURBO(256, GGML_TYPE_F16,      GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE_TURBO(128, GGML_TYPE_F16,      GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE_TURBO(256, GGML_TYPE_F16,      GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE_TURBO(128, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE_TURBO(256, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO5_0)
+    FATTN_VEC_CASE_TURBO(128, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO6_0)
+    FATTN_VEC_CASE_TURBO(256, GGML_TYPE_TURBO6_0, GGML_TYPE_TURBO6_0)
     FATTN_VEC_CASE_TURBO(512, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASE_TURBO(512, GGML_TYPE_TURBO3_0, GGML_TYPE_F16)
     return nullptr;
@@ -769,6 +782,8 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO5_0:
+        case GGML_TYPE_TURBO6_0:
             return true;
         default:
             return false;
@@ -880,8 +895,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // TurboQuant: only the vec kernel has turbo dequant support (D up to 512 for Gemma4).
     if (K->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO2_0 ||
         K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0 ||
-        K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0) {
+        K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0 ||
+        K->type == GGML_TYPE_TURBO5_0 || V->type == GGML_TYPE_TURBO5_0 ||
+        K->type == GGML_TYPE_TURBO6_0 || V->type == GGML_TYPE_TURBO6_0) {
         const bool can_use_vector_kernel_turbo = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+        // turbo5/turbo6 have vec instances (and an f16 fallback instance to convert into) for D=128/256 only
+        const bool turbo56 = K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0 ||
+                             V->type == GGML_TYPE_TURBO5_0 || V->type == GGML_TYPE_TURBO6_0;
+        if (turbo56 && Q->ne[0] != 128 && Q->ne[0] != 256) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
         if (can_use_vector_kernel_turbo) {
             return BEST_FATTN_KERNEL_VEC;
         }
@@ -1019,7 +1042,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const bool turbo_k = (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0);
     const bool turbo_v = (V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0);
-    const bool turbo_kv = turbo_k || turbo_v;
+    // turbo5/turbo6 have no fp16 shadow-cache kernels: they always take the native vec path below
+    const bool turbo56_kv = K->type == GGML_TYPE_TURBO5_0 || K->type == GGML_TYPE_TURBO6_0 ||
+                            V->type == GGML_TYPE_TURBO5_0 || V->type == GGML_TYPE_TURBO6_0;
+    const bool turbo_kv = turbo_k || turbo_v || turbo56_kv;
 
     // For non-turbo types, go straight to the normal dispatch.
     if (!turbo_kv) {
@@ -1045,7 +1071,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // as-is from upstream for reference/testing) — set GGML_TURBO_SHADOW_CACHE=1 to
     // opt into it instead of the native path.
     static const bool turbo_shadow = (getenv("GGML_TURBO_SHADOW_CACHE") != nullptr);
-    if (!turbo_shadow) {
+    if (!turbo_shadow || turbo56_kv) {
         switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
             case BEST_FATTN_KERNEL_NONE:
                 GGML_ABORT("fatal error");

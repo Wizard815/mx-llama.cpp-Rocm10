@@ -447,3 +447,156 @@ size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     }
     return nrows * row_size;
 }
+
+/* ---------- TURBO5_0 / TURBO6_0: 5/6-bit PolarQuant (no QJL) ----------
+ *
+ * Codebooks: Lloyd-Max centroids for N(0, 1/128), from TheTom/llama-cpp-turboquant PR #381.
+ * Mirrored in ggml-cuda/turbo56.cuh. Like turbo2/turbo3 here, this CPU reference is the codec
+ * only: it does not apply the WHT. On the GPU the rotation happens in SET_ROWS
+ * (ggml-cuda/turbo-quant.cu), so a dequantized row is in the rotated domain there as well.
+ * Each 128-value block stores the norm corrected by the reconstruction norm, so a dequantized
+ * block has the L2 norm of the input block.
+ */
+
+static const float TURBO6_CENTROIDS[64] = {
+    -0.330935f, -0.286417f, -0.257865f, -0.236198f,
+    -0.218435f, -0.203203f, -0.189753f, -0.177626f,
+    -0.166522f, -0.156230f, -0.146600f, -0.137517f,
+    -0.128895f, -0.120663f, -0.112765f, -0.105157f,
+    -0.097801f, -0.090663f, -0.083717f, -0.076940f,
+    -0.070310f, -0.063809f, -0.057422f, -0.051133f,
+    -0.044929f, -0.038798f, -0.032729f, -0.026710f,
+    -0.020733f, -0.014787f, -0.008863f, -0.002953f,
+     0.002953f,  0.008863f,  0.014787f,  0.020733f,
+     0.026710f,  0.032729f,  0.038798f,  0.044929f,
+     0.051133f,  0.057422f,  0.063809f,  0.070310f,
+     0.076940f,  0.083717f,  0.090663f,  0.097801f,
+     0.105157f,  0.112765f,  0.120663f,  0.128895f,
+     0.137517f,  0.146600f,  0.156230f,  0.166522f,
+     0.177626f,  0.189753f,  0.203203f,  0.218435f,
+     0.236198f,  0.257865f,  0.286417f,  0.330935f
+};
+
+static const float TURBO5_CENTROIDS[32] = {
+    -0.288236f, -0.237892f, -0.204892f, -0.179348f,
+    -0.158003f, -0.139353f, -0.122569f, -0.107141f,
+    -0.092730f, -0.079097f, -0.066064f, -0.053491f,
+    -0.041269f, -0.029304f, -0.017515f, -0.005827f,
+     0.005827f,  0.017515f,  0.029304f,  0.041269f,
+     0.053491f,  0.066064f,  0.079097f,  0.092730f,
+     0.107141f,  0.122569f,  0.139353f,  0.158003f,
+     0.179348f,  0.204892f,  0.237892f,  0.288236f
+};
+
+/* nearest centroid: binary search on the midpoints of a sorted codebook */
+static int turbo_nearest_centroid_sorted(const float * c, int n, float val) {
+    int lo = 0;
+    int hi = n - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (val < 0.5f*(c[mid] + c[mid + 1])) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return lo;
+}
+
+/* quantize one 128-value block to codebook indices, returns the corrected norm */
+static float turbo56_quantize_block(const float * src, const float * c, int n_c, uint8_t * idx) {
+    float norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) norm_sq += src[j] * src[j];
+    const float norm     = sqrtf(norm_sq);
+    const float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+
+    float recon_sq = 0.0f;
+    for (int j = 0; j < 128; j++) {
+        idx[j] = (uint8_t) turbo_nearest_centroid_sorted(c, n_c, src[j] * inv_norm);
+        recon_sq += c[idx[j]] * c[idx[j]];
+    }
+    const float recon_norm = sqrtf(recon_sq);
+    return recon_norm > 1e-10f ? norm / recon_norm : norm;
+}
+
+void quantize_row_turbo6_0_ref(const float * GGML_RESTRICT x, block_turbo6_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO6 == 0);
+    const int64_t nb = k / QK_TURBO6;
+    for (int64_t ib = 0; ib < nb; ib++) {
+        uint8_t idx[QK_TURBO6];
+        y[ib].norm = GGML_FP32_TO_FP16(turbo56_quantize_block(x + ib*QK_TURBO6, TURBO6_CENTROIDS, 64, idx));
+        memset(y[ib].qs, 0, sizeof(y[ib].qs));
+        memset(y[ib].qh, 0, sizeof(y[ib].qh));
+        for (int j = 0; j < QK_TURBO6; j++) {
+            y[ib].qs[j/2] |= (uint8_t) ((idx[j] & 0xF) << ((j % 2) * 4));
+            y[ib].qh[j/4] |= (uint8_t) (((idx[j] >> 4) & 0x3) << ((j % 4) * 2));
+        }
+    }
+}
+
+void dequantize_row_turbo6_0(const block_turbo6_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO6 == 0);
+    const int64_t nb = k / QK_TURBO6;
+    for (int64_t ib = 0; ib < nb; ib++) {
+        const float norm = GGML_FP16_TO_FP32(x[ib].norm);
+        for (int j = 0; j < QK_TURBO6; j++) {
+            const int lo = (x[ib].qs[j/2] >> ((j % 2) * 4)) & 0xF;
+            const int hi = (x[ib].qh[j/4] >> ((j % 4) * 2)) & 0x3;
+            y[ib*QK_TURBO6 + j] = TURBO6_CENTROIDS[lo | (hi << 4)] * norm;
+        }
+    }
+}
+
+size_t quantize_turbo6_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                         int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO6 == 0);
+
+    const size_t row_size = (n_per_row / QK_TURBO6) * sizeof(block_turbo6_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo6_0_ref(src + row * n_per_row, (block_turbo6_0 *) ((char *) dst + row * row_size), n_per_row);
+    }
+    return nrows * row_size;
+}
+
+void quantize_row_turbo5_0_ref(const float * GGML_RESTRICT x, block_turbo5_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO5 == 0);
+    const int64_t nb = k / QK_TURBO5;
+    for (int64_t ib = 0; ib < nb; ib++) {
+        uint8_t idx[QK_TURBO5];
+        y[ib].norm = GGML_FP32_TO_FP16(turbo56_quantize_block(x + ib*QK_TURBO5, TURBO5_CENTROIDS, 32, idx));
+        memset(y[ib].qs, 0, sizeof(y[ib].qs));
+        memset(y[ib].qh, 0, sizeof(y[ib].qh));
+        for (int j = 0; j < QK_TURBO5; j++) {
+            const uint8_t neg = idx[j] < 16;
+            const uint8_t mag = neg ? (uint8_t) (15 - idx[j]) : (uint8_t) (idx[j] - 16);
+            y[ib].qs[j/2] |= (uint8_t) (mag << ((j % 2) * 4));
+            y[ib].qh[j/8] |= (uint8_t) (neg << (j % 8));
+        }
+    }
+}
+
+void dequantize_row_turbo5_0(const block_turbo5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO5 == 0);
+    const int64_t nb = k / QK_TURBO5;
+    for (int64_t ib = 0; ib < nb; ib++) {
+        const float norm = GGML_FP16_TO_FP32(x[ib].norm);
+        for (int j = 0; j < QK_TURBO5; j++) {
+            const int mag = (x[ib].qs[j/2] >> ((j % 2) * 4)) & 0xF;
+            const int neg = (x[ib].qh[j/8] >> (j % 8)) & 0x1;
+            y[ib*QK_TURBO5 + j] = TURBO5_CENTROIDS[neg ? 15 - mag : 16 + mag] * norm;
+        }
+    }
+}
+
+size_t quantize_turbo5_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                         int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO5 == 0);
+
+    const size_t row_size = (n_per_row / QK_TURBO5) * sizeof(block_turbo5_0);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo5_0_ref(src + row * n_per_row, (block_turbo5_0 *) ((char *) dst + row * row_size), n_per_row);
+    }
+    return nrows * row_size;
+}

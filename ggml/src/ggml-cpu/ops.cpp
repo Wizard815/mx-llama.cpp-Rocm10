@@ -12432,3 +12432,96 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_turbo_wht
+
+// Sign vectors of the TurboQuant FWHT rotation, copied from ggml-cuda/turbo-quant.cu
+// (K: d_turbo_wht_signs1/2, V: d_turbo_wht_signs1_v/2_v). They must stay identical.
+static const float turbo_wht_s1_k[128] = {
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1,
+     1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,
+     1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,
+     1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1,
+     1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1,
+};
+static const float turbo_wht_s2_k[128] = {
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1,
+     1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,
+    -1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,
+    -1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1,
+};
+static const float turbo_wht_s1_v[128] = {
+     1,-1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1,
+     1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1,
+    -1, 1,-1, 1,-1,-1, 1,-1, 1,-1,-1,-1, 1,-1,-1, 1,
+     1,-1,-1,-1, 1,-1,-1,-1, 1, 1,-1, 1, 1,-1,-1,-1,
+     1,-1, 1,-1,-1, 1,-1,-1, 1,-1,-1, 1, 1, 1,-1, 1,
+    -1,-1,-1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1,-1,-1,-1,
+     1,-1,-1, 1, 1,-1, 1, 1,-1,-1,-1,-1, 1, 1,-1, 1,
+    -1,-1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1, 1, 1,-1,
+};
+static const float turbo_wht_s2_v[128] = {
+    -1, 1, 1,-1, 1,-1,-1,-1, 1,-1, 1, 1, 1, 1, 1, 1,
+     1, 1, 1, 1,-1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1,
+     1, 1,-1, 1, 1,-1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,
+    -1,-1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1, 1,-1,-1,
+    -1, 1,-1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,
+    -1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1, 1,-1, 1, 1,
+     1, 1,-1, 1,-1,-1, 1,-1,-1,-1,-1,-1, 1,-1,-1, 1,
+     1, 1,-1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1,-1,-1, 1,
+};
+
+// direction 0: y = R_K x with R_K = D2_K H D1_K / sqrt(128) (pre-rotate Q to K's storage domain)
+// direction 1: y = R_V^T x with R_V^T = D1_V H D2_V / sqrt(128) (undo V's storage rotation)
+// Same as kernel_turbo_wht in ggml-cuda/turbo-quant.cu.
+void ggml_compute_forward_turbo_wht(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+
+    int32_t direction;
+    memcpy(&direction, dst->op_params, sizeof(int32_t));
+    GGML_ASSERT(direction == 0 || direction == 1);
+
+    const float * s_first  = direction == 0 ? turbo_wht_s1_k : turbo_wht_s2_v;
+    const float * s_second = direction == 0 ? turbo_wht_s2_k : turbo_wht_s1_v;
+
+    const int64_t n_groups = ggml_nelements(src0) / 128;
+    GGML_ASSERT(ggml_nelements(src0) % 128 == 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const float * src = (const float *) src0->data;
+    float       * out = (float       *) dst->data;
+
+    for (int64_t g = ith; g < n_groups; g += nth) {
+        float x[128];
+        for (int i = 0; i < 128; ++i) {
+            x[i] = src[g*128 + i] * s_first[i];
+        }
+        for (int h = 1; h < 128; h *= 2) {
+            for (int i = 0; i < 128; i += 2*h) {
+                for (int j = i; j < i + h; ++j) {
+                    const float a = x[j];
+                    const float b = x[j + h];
+                    x[j]     = a + b;
+                    x[j + h] = a - b;
+                }
+            }
+        }
+        for (int i = 0; i < 128; ++i) {
+            out[g*128 + i] = x[i] * 0.08838834764831845f * s_second[i];
+        }
+    }
+}

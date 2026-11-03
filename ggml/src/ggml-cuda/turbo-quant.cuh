@@ -17,3 +17,5 @@ void ggml_cuda_op_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_set_rows_turbo2(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_set_rows_turbo3(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_set_rows_turbo4(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_op_set_rows_turbo5(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_op_set_rows_turbo6(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

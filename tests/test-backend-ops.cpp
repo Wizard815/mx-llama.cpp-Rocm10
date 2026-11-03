@@ -9086,6 +9086,27 @@ struct test_diag : public test_case {
     }
 };
 
+// GGML_OP_TURBO_WHT
+struct test_turbo_wht : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int direction;
+
+    std::string vars() override { return VARS_TO_STR2(ne, direction); }
+
+    test_turbo_wht(std::array<int64_t, 4> ne = { 128, 4, 8, 1 }, int direction = 0)
+        : ne(ne), direction(direction) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_turbo_wht(ctx, a, direction);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_LIGHTNING_INDEXER
 struct test_lightning_indexer : public test_case {
     const int64_t hsk; // indexer K head size
@@ -11886,6 +11907,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 17, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // TurboQuant turbo5/turbo6 KV caches (128-value blocks, so head sizes 128/256; the CUDA turbo
+    // path needs n_kv % 256 == 0). The data are random codes, rotation is tested by test_turbo_wht.
+    for (ggml_type type_K : { GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO6_0 }) {
+        for (ggml_type type_V : { GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO6_0 }) {
+            if ((type_K == GGML_TYPE_TURBO5_0 || type_K == GGML_TYPE_TURBO6_0) && type_K != type_V) {
+                continue;
+            }
+            for (int hs : { 128, 256 }) {
+                for (int nr2 : { 1, 4 }) {
+                    for (int nb : { 1, 3, 32 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(
+                            hs, hs, 4, {nr2, 1}, 512, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+                    }
+                }
+            }
+        }
+    }
+    for (int direction : { 0, 1 }) {
+        test_cases.emplace_back(new test_turbo_wht({ 128, 4, 8, 1 }, direction));
+        test_cases.emplace_back(new test_turbo_wht({ 256, 3, 5, 2 }, direction));
+    }
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));

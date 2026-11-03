@@ -49,6 +49,12 @@ plus these later ggml-org/llama.cpp commits cherry-picked for HIP/GCN:
   converted to f16 at run time). **Multi-GPU layer-split is unverified** - the shared
   rotation-matrix tensor is allocated on whichever GPU's context builds first. Test this
   first on real hardware.
+- turbo5 / turbo6 KV cache types (5.125 / 6.125 bits per value, 32/64-entry codebooks, ported
+  from TheTom/llama-cpp-turboquant PR #381). They are meant as V types with a q8_0 K
+  (`-ctk q8_0 -ctv turbo5|turbo6`); as K types they lose quality. Head size must be 128 or 256.
+  FA vec instances: q8_0/f16 K with turbo5/turbo6 V, and turbo5/turbo5, turbo6/turbo6. Mixed
+  turbo/plain K/V pairs are rotated correctly: Q is rotated iff K is turbo, the attention
+  output is inverse-rotated (with V's rotation) iff V is turbo.
 - Tensor-split helpers: meta-backend split rules for the turbo WHT op and for elementwise ops
   between a MIRRORED and a split operand; backend sampling under `-sm tensor` when the output
   is mirrored (also enabled for MTP)
