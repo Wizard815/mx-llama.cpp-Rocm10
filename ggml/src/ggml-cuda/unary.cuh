@@ -93,6 +93,11 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+// ADD -> SOFTPLUS -> MUL (the GDN gate), F32, b and g full-shaped or one broadcast row; sig (optional): an independent
+// SIGMOID computed in the same launch. false: not applicable, nothing launched.
+bool ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * unary_node,
+                                   ggml_tensor * mul_node, ggml_tensor * sig);
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {

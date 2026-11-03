@@ -4901,6 +4901,12 @@ static bool ggml_cuda_moe_weighted_reduction_enabled() {
     return enabled;
 }
 
+// GGML_CUDA_NO_<X>_FUSION=1 switches one fusion off; unset or 0 leaves it on
+static bool ggml_cuda_fusion_env_off(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr && std::atoi(env) != 0;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5101,6 +5107,63 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x) {
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
+        }
+    }
+
+    // residual ADD (or the two-ADD chain the multi-add fusion below would take) -> RMS_NORM -> MUL in one launch.
+    // The sum stays live (the next residual reads it), so it is written as a second output; only the
+    // intermediate of a two-ADD chain and the RMS_NORM output are elided, both through the single-use checks.
+    static const bool no_add_norm = ggml_cuda_fusion_env_off("GGML_CUDA_NO_ADD_NORM_FUSION");
+    if (!no_add_norm && node->op == GGML_OP_ADD) {
+        ggml_tensor * add1     = nullptr;
+        int           norm_idx = i + 1;
+        if (i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_ADD &&
+                ggml_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_ADD })) {
+            add1     = cgraph->nodes[i + 1];
+            norm_idx = i + 2;
+        }
+        // leave the norm to the fusions that already take it in one launch with what follows
+        if (norm_idx + 1 < cgraph->n_nodes && cgraph->nodes[norm_idx]->op == GGML_OP_RMS_NORM &&
+                cgraph->nodes[norm_idx]->src[0] == cgraph->nodes[norm_idx - 1] &&
+                ggml_cuda_can_fuse(cgraph, norm_idx, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) &&
+                !ggml_cuda_can_fuse(cgraph, norm_idx, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {}) &&
+                !ggml_cuda_can_fuse(cgraph, norm_idx, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {}) &&
+                !ggml_cuda_can_fuse(cgraph, norm_idx, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {}) &&
+                ggml_cuda_op_add_rms_norm_mul_fused(*cuda_ctx, node, add1, cgraph->nodes[norm_idx], cgraph->nodes[norm_idx + 1])) {
+            return norm_idx + 1 - i;
+        }
+    }
+
+    // GDN gate: ADD -> SOFTPLUS -> MUL (softplus(alpha + ssm_dt) * ssm_a), plus the beta SIGMOID when it is the next
+    // node after views: three launches per recurrent layer become one. The SIGMOID is not adjacent, so it is only
+    // taken when no concurrent streams are set up and no other fusion starts at it.
+    static const bool no_gdn_gate = ggml_cuda_fusion_env_off("GGML_CUDA_NO_GDN_GATE_FUSION");
+    if (!no_gdn_gate && node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes &&
+            ggml_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }) &&
+            ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SOFTPLUS) {
+        ggml_tensor * sig     = nullptr;
+        int           sig_idx = -1;
+        if (cuda_ctx->stream_context().concurrent_events.empty()) {
+            int j = i + 3;
+            while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                j++;
+            }
+            if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(cgraph->nodes[j]) == GGML_UNARY_OP_SIGMOID &&
+                    (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                    !ggml_cuda_can_fuse(cgraph, j, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID })) {
+                ggml_cuda_topk_moe_args topk_args;
+                if (!ggml_cuda_topk_moe_fusion(cgraph, j, topk_args)) {
+                    sig     = cgraph->nodes[j];
+                    sig_idx = j;
+                }
+            }
+        }
+        if (sig && ggml_cuda_op_add_softplus_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], sig)) {
+            return sig_idx - i;
+        }
+        if (ggml_cuda_op_add_softplus_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr)) {
+            return 2;
         }
     }
 
@@ -5717,6 +5780,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    // the GDN q and k l2 norms: two independent RMS_NORM -> SCALE pairs with only views between, one launch
+    static const bool no_l2_norm_pair = ggml_cuda_fusion_env_off("GGML_CUDA_NO_GDN_L2_NORM_PAIR_FUSION");
+    if (!no_l2_norm_pair && node->op == GGML_OP_RMS_NORM && cuda_ctx->stream_context().concurrent_events.empty() &&
+            ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+        int j = i + 2;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            j++;
+        }
+        if (j + 1 < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_RMS_NORM &&
+                ggml_cuda_can_fuse(cgraph, j, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {}) &&
+                ggml_cuda_op_rms_norm_scale_pair_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[j], cgraph->nodes[j + 1])) {
+            return j + 1 - i;
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
