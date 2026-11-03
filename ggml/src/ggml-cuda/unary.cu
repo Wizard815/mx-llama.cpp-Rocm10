@@ -761,6 +761,115 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
+/* fused add + softplus + mul (+ an independent sigmoid): the GDN gate and beta */
+
+// dst = softplus(a + b) * g with b and g either full-shaped or broadcast rows (nb, ng elements), the arithmetic of the
+// separate ADD, SOFTPLUS and MUL ops; i < ks additionally computes sy = sigmoid(sx), an unrelated SIGMOID node
+static __global__ void add_softplus_mul_kernel(const float * a, const float * b, const float * g, float * dst, const int64_t k,
+                                               const int64_t nb, const int64_t ng,
+                                               const float * sx, float * sy, const int64_t ks) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    if (i < k) {
+        dst[i] = op_softplus(a[i] + b[i % nb]) * g[i % ng];
+    }
+    if (i < ks) {
+        sy[i] = op_sigmoid(sx[i]);
+    }
+}
+
+static bool unary_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+bool ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * unary_node,
+                                   ggml_tensor * mul_node, ggml_tensor * sig) {
+    if (ggml_get_unary_op(unary_node) != GGML_UNARY_OP_SOFTPLUS || unary_node->src[0] != add) {
+        return false;
+    }
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    const ggml_tensor * g = nullptr;
+    if (mul_node->src[0] == unary_node) {
+        g = mul_node->src[1];
+    } else if (mul_node->src[1] == unary_node) {
+        g = mul_node->src[0];
+    } else {
+        return false;
+    }
+
+    const ggml_tensor * full[] = { a, add, unary_node, mul_node };
+    for (const ggml_tensor * t : full) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, mul_node)) {
+            return false;
+        }
+    }
+    // b and g: the full shape, or one row broadcast over all others (ssm_dt and ssm_a)
+    const int64_t ne0 = mul_node->ne[0];
+    auto row_or_full = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
+               (ggml_are_same_shape(t, mul_node) || (t->ne[0] == ne0 && ggml_nelements(t) == ne0));
+    };
+    if (!row_or_full(b) || !row_or_full(g)) {
+        return false;
+    }
+
+    // dst may take a's memory exactly (elementwise, same index), but must not touch the broadcast operands
+    if (unary_ranges_overlap(mul_node, a) && mul_node->data != a->data) {
+        return false;
+    }
+    if (unary_ranges_overlap(mul_node, b) || unary_ranges_overlap(mul_node, g)) {
+        return false;
+    }
+
+    const int64_t k  = ggml_nelements(mul_node);
+    const float * sx = nullptr;
+    float *       sy = nullptr;
+    int64_t       ks = 0;
+    if (sig != nullptr) {
+        const ggml_tensor * s0 = sig->src[0];
+        if (ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || s0->type != GGML_TYPE_F32 || sig->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(s0) || !ggml_is_contiguous(sig) || !ggml_are_same_shape(s0, sig)) {
+            return false;
+        }
+        // independent of the gate: it reads none of the gate's outputs, and its output touches none of the gate's
+        // operands (it may only overwrite its own input, elementwise)
+        const ggml_tensor * gate_nodes[] = { add, unary_node, mul_node };
+        for (const ggml_tensor * t : gate_nodes) {
+            if (s0 == t || s0->view_src == t) {
+                return false;
+            }
+        }
+        if (unary_ranges_overlap(s0, mul_node)) {
+            return false;
+        }
+        const ggml_tensor * gate_io[] = { a, b, g, mul_node };
+        for (const ggml_tensor * t : gate_io) {
+            if (unary_ranges_overlap(sig, t)) {
+                return false;
+            }
+        }
+        if (unary_ranges_overlap(sig, s0) && sig->data != s0->data) {
+            return false;
+        }
+        sx = (const float *) s0->data;
+        sy = (float *) sig->data;
+        ks = ggml_nelements(sig);
+    }
+
+    const int64_t n         = k > ks ? k : ks;
+    const int     nblocks   = (int) ((n + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) nblocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(add_softplus_mul_kernel, launch_params,
+        (const float *) a->data, (const float *) b->data, (const float *) g->data, (float *) mul_node->data, k,
+        ggml_nelements(b), ggml_nelements(g), sx, sy, ks);
+    return true;
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {

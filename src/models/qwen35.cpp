@@ -373,6 +373,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
+    // schedule the beta projection here so its SIGMOID lands right after the gate below (views between):
+    // the CUDA backend computes the gate ADD -> SOFTPLUS -> MUL and this SIGMOID in one launch
+    ggml_build_forward_expand(gf, beta);
+
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 

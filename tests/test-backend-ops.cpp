@@ -4151,6 +4151,191 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
+// residual GGML_OP_ADD (one or two) + GGML_OP_RMS_NORM + GGML_OP_MUL, with the sum read again afterwards
+// (the decoder residual stream); the CUDA backend fuses the adds into the norm and writes the sum as a second output
+struct test_add_rms_norm_mul : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const int  n_add;   // 1: x = a + b, 2: x = (a + b) + c
+    const bool inplace; // the last add writes into its first operand
+    const float eps;
+
+    ggml_tensor * sum = nullptr;
+    ggml_tensor * mul = nullptr;
+    ggml_tensor * out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { sum, mul, out }; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, ne, n_add, inplace, eps);
+    }
+
+    test_add_rms_norm_mul(ggml_type type = GGML_TYPE_F32, std::array<int64_t, 4> ne = {2048, 1, 1, 1},
+            int n_add = 1, bool inplace = false, float eps = 1e-6f)
+        : type(type), ne(ne), n_add(n_add), inplace(inplace), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, type, ne[0]);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(w, "w");
+
+        if (n_add == 2) {
+            ggml_tensor * c = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_name(c, "c");
+            ggml_tensor * ab = ggml_add(ctx, a, b);
+            sum = inplace ? ggml_add_inplace(ctx, ab, c) : ggml_add(ctx, ab, c);
+        } else {
+            sum = inplace ? ggml_add_inplace(ctx, a, b) : ggml_add(ctx, a, b);
+        }
+        ggml_set_name(sum, "sum");
+
+        mul = ggml_mul(ctx, ggml_rms_norm(ctx, sum, eps), w);
+        ggml_set_name(mul, "mul");
+
+        // the sum has a second consumer after the norm, like the next residual add
+        out = ggml_mul(ctx, mul, sum);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
+// the Gated DeltaNet gate and beta of qwen35/qwen35moe: softplus(alpha + ssm_dt) * ssm_a, then sigmoid(beta) after a
+// view; the CUDA backend computes the ADD, SOFTPLUS, MUL and the SIGMOID in one launch
+struct test_gdn_gate : public test_case {
+    const int64_t n_head;
+    const int64_t n_tokens;
+    const bool    with_sigmoid;
+
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * beta = nullptr;
+    ggml_tensor * out  = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (with_sigmoid) {
+            return { gate, beta, out };
+        }
+        return { gate, out };
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_head, n_tokens, with_sigmoid);
+    }
+
+    test_gdn_gate(int64_t n_head = 32, int64_t n_tokens = 1, bool with_sigmoid = true)
+        : n_head(n_head), n_tokens(n_tokens), with_sigmoid(with_sigmoid) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * alpha = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_tokens);
+        ggml_tensor * dt    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head);
+        ggml_tensor * a     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head);
+        ggml_set_name(alpha, "alpha");
+        ggml_set_name(dt, "ssm_dt");
+        ggml_set_name(a, "ssm_a");
+
+        gate = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), a);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * gate_4d = ggml_reshape_4d(ctx, gate, 1, n_head, n_tokens, 1);
+
+        if (!with_sigmoid) {
+            out = ggml_scale(ctx, gate_4d, 0.5f);
+            ggml_set_name(out, "out");
+            return out;
+        }
+
+        ggml_tensor * beta_raw = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_head, n_tokens, 1);
+        ggml_set_name(beta_raw, "beta_raw");
+        beta = ggml_sigmoid(ctx, beta_raw);
+        ggml_set_name(beta, "beta");
+
+        out = ggml_add(ctx, gate_4d, beta);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // wide enough to reach the linear branch of softplus (x > 20)
+            init_tensor_uniform(t, -25.f, 25.f);
+        }
+    }
+};
+
+// the Gated DeltaNet q and k l2 norms: two RMS_NORM -> SCALE pairs over views of one conv output, views between;
+// the CUDA backend runs both pairs in one launch
+struct test_gdn_l2_norm_pair : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_tokens;
+
+    ggml_tensor * q   = nullptr;
+    ggml_tensor * k   = nullptr;
+    ggml_tensor * out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_L2_NORM_PAIR";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { q, k, out }; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(head_dim, n_head, n_tokens);
+    }
+
+    test_gdn_l2_norm_pair(int64_t head_dim = 128, int64_t n_head = 16, int64_t n_tokens = 1)
+        : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // q, k and v side by side in each token row, as the conv output of a recurrent layer
+        const int64_t row = 4*head_dim*n_head;
+        ggml_tensor * conv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, n_tokens);
+        ggml_set_name(conv, "conv");
+
+        auto l2_norm = [&](size_t offset) {
+            ggml_tensor * x = ggml_view_4d(ctx, conv, head_dim, n_head, n_tokens, 1,
+                    ggml_row_size(conv->type, head_dim), conv->nb[1], conv->nb[1]*n_tokens, offset);
+            const float n = head_dim;
+            return ggml_scale(ctx, ggml_rms_norm(ctx, x, 1e-6f/n), 1.0f/sqrtf(n));
+        };
+        q = l2_norm(0);
+        ggml_set_name(q, "q");
+        k = l2_norm(ggml_row_size(conv->type, head_dim*n_head));
+        ggml_set_name(k, "k");
+
+        out = ggml_add(ctx, q, k);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_UNARY(RELU) + GGML_OP_SQR (fused operation)
 struct test_relu_sqr : public test_case {
     const ggml_type type;
@@ -10741,6 +10926,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
+
+    // residual add(s) -> rms_norm -> mul with the sum live afterwards, decode shapes (n_embd 2048, 1..8 tokens)
+    for (int n_add : {1, 2}) {
+        for (int64_t n_tokens = 1; n_tokens <= 8; ++n_tokens) {
+            test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {2048, n_tokens, 1, 1}, n_add));
+        }
+        test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {2048, 1, 1, 1}, n_add, true));
+        test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {2048, 4, 1, 1}, n_add, true));
+        test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {2050, 3, 1, 1}, n_add));  // not a multiple of 4
+        test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {64, 5, 4, 3}, n_add));
+        test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {16388, 2, 1, 1}, n_add)); // above the vectorized range
+    }
+
+    // GDN gate + beta sigmoid and the q/k l2 norm pair, qwen35moe decode shapes
+    for (int64_t n_tokens = 1; n_tokens <= 8; ++n_tokens) {
+        test_cases.emplace_back(new test_gdn_gate(32, n_tokens, true));
+        test_cases.emplace_back(new test_gdn_l2_norm_pair(128, 16, n_tokens));
+    }
+    test_cases.emplace_back(new test_gdn_gate(32, 1, false));
+    test_cases.emplace_back(new test_gdn_gate(48, 4, false));
+    test_cases.emplace_back(new test_gdn_l2_norm_pair(64, 4, 3));
+    test_cases.emplace_back(new test_gdn_l2_norm_pair(130, 4, 2)); // not a multiple of 4
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));

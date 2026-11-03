@@ -99,7 +99,11 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool clamped = false>
+// n_resid > 0: x is the first operand of a residual ADD chain, the sum x + resid0 (+ resid1) is computed while loading,
+// written to resid_sum and normalized; every element is read and written by the same thread, so outputs may alias inputs exactly.
+// do_pair: blockIdx.z >= nsamples runs a second same-shape norm on x1/dst1 (the GDN q and k l2 norms in one launch).
+template <int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool clamped = false,
+          int n_resid = 0, bool do_pair = false>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -125,7 +129,12 @@ static __global__ void rms_norm_f32(const float * x,
                                     const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
                                     const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
                                     const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
-                                    const float   scale_out            = 1.0f) {
+                                    const float   scale_out            = 1.0f,
+                                    const float * resid0               = nullptr,
+                                    const float * resid1               = nullptr,
+                                    float *       resid_sum            = nullptr,
+                                    const float * x1                   = nullptr,
+                                    float *       dst1                 = nullptr) {
     ggml_cuda_pdl_lc();
     const int nrows = gridDim.x;
     const int row   = blockIdx.x;
@@ -133,16 +142,42 @@ static __global__ void rms_norm_f32(const float * x,
 
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
     static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
+    static_assert(n_resid >= 0 && n_resid <= 2, "at most two residual addends");
+    static_assert(!do_pair || (!clamped && n_resid == 0), "the norm pair needs an unclamped grid");
 
     extern __shared__ float s_sum[];
 
     ggml_cuda_pdl_sync();
 
+    int sample0 = blockIdx.z;
+    if constexpr (do_pair) {
+        if (sample0 >= nsamples) {
+            x        = x1;
+            dst      = dst1;
+            sample0 -= nsamples;
+        }
+    }
+    GGML_UNUSED(x1);
+    GGML_UNUSED(dst1);
+
     // grid.y and grid.z are clamped to the CUDA limit, iterate over the excess channels/samples
-    for (int sample = blockIdx.z;; sample += gridDim.z) {
+    for (int sample = sample0;; sample += gridDim.z) {
         for (int channel = blockIdx.y;; channel += gridDim.y) {
-            const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
+            const int64_t x_off = sample*stride_sample + channel*stride_channel + row*stride_row;
+            const float * xc   = x   + x_off;
             float       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
+
+            // residual operands and the sum share x's layout (contiguous, checked on the host)
+            [[maybe_unused]] const float * r0c = nullptr;
+            [[maybe_unused]] const float * r1c = nullptr;
+            [[maybe_unused]] float *       sc  = nullptr;
+            if constexpr (n_resid > 0) {
+                r0c = resid0    + x_off;
+                sc  = resid_sum + x_off;
+            }
+            if constexpr (n_resid > 1) {
+                r1c = resid1 + x_off;
+            }
 
             [[maybe_unused]] const float * mulc = nullptr;
             if constexpr (do_multiply) {
@@ -175,6 +210,23 @@ static __global__ void rms_norm_f32(const float * x,
                     const int i = tid + k*block_size;
                     if (i < ncols4) {
                         xs[k] = x4[i];
+                        if constexpr (n_resid > 0) {
+                            const float4 r = ((const float4 *) r0c)[i];
+                            xs[k].x += r.x;
+                            xs[k].y += r.y;
+                            xs[k].z += r.z;
+                            xs[k].w += r.w;
+                        }
+                        if constexpr (n_resid > 1) {
+                            const float4 r = ((const float4 *) r1c)[i];
+                            xs[k].x += r.x;
+                            xs[k].y += r.y;
+                            xs[k].z += r.z;
+                            xs[k].w += r.w;
+                        }
+                        if constexpr (n_resid > 0) {
+                            ((float4 *) sc)[i] = xs[k];
+                        }
                         tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
                     }
                 }
@@ -213,7 +265,16 @@ static __global__ void rms_norm_f32(const float * x,
                 float tmp = 0.0f; // partial sum for thread in warp
 
                 for (int col = tid; col < ncols; col += block_size) {
-                    const float xi = xc[col];
+                    float xi = xc[col];
+                    if constexpr (n_resid > 0) {
+                        xi += r0c[col];
+                    }
+                    if constexpr (n_resid > 1) {
+                        xi += r1c[col];
+                    }
+                    if constexpr (n_resid > 0) {
+                        sc[col] = xi;
+                    }
                     tmp += xi * xi;
                 }
 
@@ -222,6 +283,11 @@ static __global__ void rms_norm_f32(const float * x,
 
                 const float mean = tmp / ncols;
                 const float scale = rsqrtf(mean + eps);
+
+                // with a residual sum, normalize the sum this thread just wrote rather than x
+                if constexpr (n_resid > 0) {
+                    xc = sc;
+                }
 
                 for (int col = tid; col < ncols; col += block_size) {
                     if constexpr (do_multiply && do_add) {
@@ -452,23 +518,25 @@ static void group_norm_f32_cuda(
         const dim3 block_dims(BLOCK_SIZE, 1, 1); \
         const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream }; \
         if (clamped_grid) { \
-            ggml_cuda_kernel_launch(rms_norm_f32<BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, true>, launch_params, \
+            ggml_cuda_kernel_launch(rms_norm_f32<BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, true, n_resid, false>, launch_params, \
                 x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, \
                 mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
                 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
                 add, add_stride_row, add_stride_channel, add_stride_sample, \
-                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out); \
+                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, \
+                resid0, resid1, resid_sum, x1, dst1); \
         } else { \
-            ggml_cuda_kernel_launch(rms_norm_f32<BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, false>, launch_params, \
+            ggml_cuda_kernel_launch(rms_norm_f32<BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, false, n_resid, do_pair>, launch_params, \
                 x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, \
                 mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
                 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
                 add, add_stride_row, add_stride_channel, add_stride_sample, \
-                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out); \
+                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, \
+                resid0, resid1, resid_sum, x1, dst1); \
         } \
     } while (0)
 
-template <bool do_multiply, bool do_add, bool do_scale>
+template <bool do_multiply, bool do_add, bool do_scale, int n_resid = 0, bool do_pair = false>
 static void rms_norm_f32_dispatch(
         const dim3     blocks_num,
         const ggml_tensor * x_t,   float * dst,   const int ncols, const int nchannels, const int nsamples,
@@ -477,7 +545,9 @@ static void rms_norm_f32_dispatch(
         const uint3    mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
         const ggml_tensor * add_t, const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
         const uint3    add_ncols_packed, const uint3 add_nrows_packed, const uint3 add_nchannels_packed, const uint3 add_nsamples_packed,
-        cudaStream_t   stream, const float scale_out = 1.0f) {
+        cudaStream_t   stream, const float scale_out = 1.0f,
+        const ggml_tensor * resid0_t = nullptr, const ggml_tensor * resid1_t = nullptr, const ggml_tensor * resid_sum_t = nullptr,
+        const ggml_tensor * x1_t = nullptr, float * dst1 = nullptr) {
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
     static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
 
@@ -485,8 +555,14 @@ static void rms_norm_f32_dispatch(
     const float * mul = mul_t ? (const float *) mul_t->data : nullptr;
     const float * add = add_t ? (const float *) add_t->data : nullptr;
 
+    const float * resid0    = resid0_t    ? (const float *) resid0_t->data    : nullptr;
+    const float * resid1    = resid1_t    ? (const float *) resid1_t->data    : nullptr;
+    float *       resid_sum = resid_sum_t ? (float *)       resid_sum_t->data : nullptr;
+    const float * x1        = x1_t        ? (const float *) x1_t->data        : nullptr;
+
     // clamped grids need the channel/sample loops in the kernel, the common case must not pay for them
     const bool clamped_grid = nchannels > UINT16_MAX || nsamples > UINT16_MAX;
+    GGML_ASSERT(!do_pair || !clamped_grid);
 
     // dst is written at row * ncols, i.e. always at a multiple of ncols, so only its base needs checking here
     bool vec = ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst & 15) == 0;
@@ -498,6 +574,15 @@ static void rms_norm_f32_dispatch(
     if constexpr (do_add) {
         vec = vec && add_ncols_packed.z == (uint32_t) ncols
             && ggml_cuda_is_aligned(add_t, 16);
+    }
+    if constexpr (n_resid > 0) {
+        vec = vec && ggml_cuda_is_aligned(resid0_t, 16) && ggml_cuda_is_aligned(resid_sum_t, 16);
+    }
+    if constexpr (n_resid > 1) {
+        vec = vec && ggml_cuda_is_aligned(resid1_t, 16);
+    }
+    if constexpr (do_pair) {
+        vec = vec && ggml_cuda_is_aligned(x1_t, 16) && ((uintptr_t) dst1 & 15) == 0;
     }
 
     const int n4 = ncols / 4;
@@ -858,6 +943,184 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                           /*add_s00*/ add_s01, add_s02, add_s03,
                           add_ncols, add_nrows, add_nchannels, add_nsamples,
                           eps, stream);
+}
+
+// [data, data + nbytes) of a and b intersect
+static bool rms_norm_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// same memory with the same (contiguous) layout, or no common byte
+static bool rms_norm_exact_or_disjoint(const ggml_tensor * a, const ggml_tensor * b) {
+    if (!rms_norm_ranges_overlap(a, b)) {
+        return true;
+    }
+    return a->data == b->data && ggml_nbytes(a) == ggml_nbytes(b) && ggml_is_contiguous(a) && ggml_is_contiguous(b);
+}
+
+bool ggml_cuda_op_add_rms_norm_mul_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add0, ggml_tensor * add1,
+                                         ggml_tensor * norm, ggml_tensor * mul_tensor) {
+    ggml_tensor * sum = add1 ? add1 : add0;
+
+    const ggml_tensor * a  = add0->src[0];
+    const ggml_tensor * b0 = add0->src[1];
+    const ggml_tensor * b1 = nullptr;
+    if (add1) {
+        if (add1->src[0] == add0) {
+            b1 = add1->src[1];
+        } else if (add1->src[1] == add0) {
+            b1 = add1->src[0];
+        } else {
+            return false;
+        }
+    }
+    if (norm->src[0] != sum) {
+        return false;
+    }
+
+    const ggml_tensor * w = nullptr;
+    if (mul_tensor->src[0] == norm) {
+        w = mul_tensor->src[1];
+    } else if (mul_tensor->src[1] == norm) {
+        w = mul_tensor->src[0];
+    } else {
+        return false;
+    }
+
+    // every addend, the intermediate sum and the final sum share one contiguous F32 layout
+    const ggml_tensor * same[] = { a, b0, add0, sum, norm, mul_tensor };
+    for (const ggml_tensor * t : same) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, sum)) {
+            return false;
+        }
+    }
+    if (b1 && (b1->type != GGML_TYPE_F32 || !ggml_is_contiguous(b1) || !ggml_are_same_shape(b1, sum))) {
+        return false;
+    }
+    if (w->type != GGML_TYPE_F32 || w->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    // the sum and the normed output are written, everything else is read in the same launch
+    const ggml_tensor * outs[] = { sum, mul_tensor };
+    for (const ggml_tensor * o : outs) {
+        if (!rms_norm_exact_or_disjoint(o, a) || !rms_norm_exact_or_disjoint(o, b0) ||
+                (b1 && !rms_norm_exact_or_disjoint(o, b1)) || rms_norm_ranges_overlap(o, w)) {
+            return false;
+        }
+    }
+    if (rms_norm_ranges_overlap(sum, mul_tensor)) {
+        return false;
+    }
+    // the unfused RMS_NORM picks its vectorized path from the sum's alignment; take the same path or leave it alone
+    const bool sum_aligned = ggml_cuda_is_aligned(sum, 16);
+    if (ggml_cuda_is_aligned(a, 16) != sum_aligned || ggml_cuda_is_aligned(b0, 16) != sum_aligned ||
+            (b1 && ggml_cuda_is_aligned(b1, 16) != sum_aligned)) {
+        return false;
+    }
+
+    float eps = 0.0f;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int64_t ne00 = sum->ne[0];
+    const int64_t ne01 = sum->ne[1];
+    const int64_t ne02 = sum->ne[2];
+    const int64_t ne03 = sum->ne[3];
+
+    const int64_t s01 = a->nb[1] / sizeof(float);
+    const int64_t s02 = a->nb[2] / sizeof(float);
+    const int64_t s03 = a->nb[3] / sizeof(float);
+
+    const int64_t mul_s01 = w->nb[1] / sizeof(float);
+    const int64_t mul_s02 = w->nb[2] / sizeof(float);
+    const int64_t mul_s03 = w->nb[3] / sizeof(float);
+
+    const uint3 zero_packed = make_uint3(0, 0, 0);
+    const dim3  blocks_num(ne01, MIN(ne02, UINT16_MAX), MIN(ne03, UINT16_MAX));
+
+#define ADD_RMS_NORM_DISPATCH(N_RESID)                                                                              \
+    rms_norm_f32_dispatch</*do_multiply*/ true, /*do_add*/ false, /*do_scale*/ false, N_RESID>(                    \
+        blocks_num, a, (float *) mul_tensor->data, ne00, ne02, ne03, s01, s02, s03, eps,                            \
+        w, mul_s01, mul_s02, mul_s03,                                                                               \
+        init_fastdiv_values(w->ne[0]), init_fastdiv_values(w->ne[1]),                                               \
+        init_fastdiv_values(w->ne[2]), init_fastdiv_values(w->ne[3]),                                               \
+        nullptr, 0, 0, 0, zero_packed, zero_packed, zero_packed, zero_packed, ctx.stream(), 1.0f,                  \
+        b0, b1, sum)
+
+    if (b1) {
+        ADD_RMS_NORM_DISPATCH(2);
+    } else {
+        ADD_RMS_NORM_DISPATCH(1);
+    }
+#undef ADD_RMS_NORM_DISPATCH
+
+    return true;
+}
+
+bool ggml_cuda_op_rms_norm_scale_pair_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm0, ggml_tensor * scale0,
+                                            ggml_tensor * norm1, ggml_tensor * scale1) {
+    const ggml_tensor * x0 = norm0->src[0];
+    const ggml_tensor * x1 = norm1->src[0];
+
+    if (scale0->src[0] != norm0 || scale1->src[0] != norm1) {
+        return false;
+    }
+    if (x0->type != GGML_TYPE_F32 || x1->type != GGML_TYPE_F32 || norm0->type != GGML_TYPE_F32 || norm1->type != GGML_TYPE_F32 ||
+            scale0->type != GGML_TYPE_F32 || scale1->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(x0, x1) || !ggml_are_same_shape(x0, scale0) || !ggml_are_same_shape(x0, scale1) ||
+            !ggml_is_contiguous(scale0) || !ggml_is_contiguous(scale1)) {
+        return false;
+    }
+    if (x0->nb[0] != sizeof(float) || x1->nb[0] != sizeof(float) ||
+            x0->nb[1] != x1->nb[1] || x0->nb[2] != x1->nb[2] || x0->nb[3] != x1->nb[3]) {
+        return false;
+    }
+    // same eps, same scale and bias
+    if (memcmp(norm0->op_params, norm1->op_params, sizeof(float)) != 0 ||
+            memcmp(scale0->op_params, scale1->op_params, 2*sizeof(float)) != 0) {
+        return false;
+    }
+    if (x0->ne[2] > UINT16_MAX || 2*x0->ne[3] > UINT16_MAX) {
+        return false;
+    }
+    // the unfused norms pick their vectorized path per tensor; both must take the same one
+    if (ggml_cuda_is_aligned(x0, 16) != ggml_cuda_is_aligned(x1, 16) ||
+            ggml_cuda_is_aligned(scale0, 16) != ggml_cuda_is_aligned(scale1, 16)) {
+        return false;
+    }
+    // both pairs run at once: no output may touch the other output or either input
+    if (rms_norm_ranges_overlap(scale0, scale1) ||
+            rms_norm_ranges_overlap(scale0, x0) || rms_norm_ranges_overlap(scale0, x1) ||
+            rms_norm_ranges_overlap(scale1, x0) || rms_norm_ranges_overlap(scale1, x1)) {
+        return false;
+    }
+
+    float eps = 0.0f;
+    memcpy(&eps, norm0->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) scale0->op_params + 0, sizeof(float));
+
+    const int64_t s01 = x0->nb[1] / sizeof(float);
+    const int64_t s02 = x0->nb[2] / sizeof(float);
+    const int64_t s03 = x0->nb[3] / sizeof(float);
+
+    const uint3 zero_packed = make_uint3(0, 0, 0);
+    const dim3  blocks_num(x0->ne[1], x0->ne[2], 2*x0->ne[3]);
+
+    rms_norm_f32_dispatch</*do_multiply*/ false, /*do_add*/ false, /*do_scale*/ true, /*n_resid*/ 0, /*do_pair*/ true>(
+        blocks_num, x0, (float *) scale0->data, x0->ne[0], x0->ne[2], x0->ne[3], s01, s02, s03, eps,
+        nullptr, 0, 0, 0, zero_packed, zero_packed, zero_packed, zero_packed,
+        nullptr, 0, 0, 0, zero_packed, zero_packed, zero_packed, zero_packed, ctx.stream(), scale,
+        nullptr, nullptr, nullptr, x1, (float *) scale1->data);
+
+    return true;
 }
 
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
