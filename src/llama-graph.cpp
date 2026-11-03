@@ -26,6 +26,12 @@
 #include <typeinfo>
 #include <unordered_set>
 
+// TurboQuant KV cache types: stored WHT-rotated in 128-value groups (see ggml-cuda/turbo-quant.cu)
+static bool llama_turbo_kv_type(ggml_type t) {
+    return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
+           t == GGML_TYPE_TURBO5_0 || t == GGML_TYPE_TURBO6_0;
+}
+
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -3312,8 +3318,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    // TurboQuant: pre-rotate Q to match WHT-rotated K in KV cache
-    if (k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
+    // TurboQuant: pre-rotate Q to match WHT-rotated K in KV cache (<R_K q, R_K k> = <q, k>)
+    if (llama_turbo_kv_type(k->type)) {
         if (q->ne[0] % 128 == 0) {
             if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
             q = ggml_turbo_wht(ctx0, q, 0);  // 0 = forward
@@ -3323,12 +3329,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    // TurboQuant: inverse-rotate attention output back to original space
-    // NOTE: guarded on k->type (not v->type) — ported from moriyasujapan's fork fix, which
-    // corrects arte-fact's original bug of guarding the inverse rotate on v->type. Applied here
-    // for consistency even though the plain (non-iswa) build_attn in the source fork still had
-    // the v->type bug at the time of this port; see port report.
-    if (k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
+    // TurboQuant: inverse-rotate attention output back to original space.
+    // Gated on v->type: SET_ROWS stores a turbo V as R_V v (V sign vectors), so the output is
+    // R_V o and GGML_OP_TURBO_WHT direction 1 applies R_V^T. The rotation of Q (K's R_K) cancels
+    // inside the scores and never reaches the output, so a plain V needs no inverse, also when K is turbo.
+    if (v && llama_turbo_kv_type(v->type)) {
         if (cur->ne[0] % 128 == 0) {
             if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
             cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
@@ -3622,8 +3627,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = use_kv_cur ? k_cur : build_get_k(mctx_cur, il);
     ggml_tensor * v = use_kv_cur ? v_cur : build_get_v(mctx_cur, il);
 
-    // TurboQuant: pre-rotate Q to match WHT-rotated K in KV cache
-    if (k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
+    // TurboQuant: pre-rotate Q to match WHT-rotated K in KV cache (<R_K q, R_K k> = <q, k>)
+    if (llama_turbo_kv_type(k->type)) {
         if (q->ne[0] % 128 == 0) {
             if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
             q = ggml_turbo_wht(ctx0, q, 0);  // 0 = forward
@@ -3633,8 +3638,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    // TurboQuant: inverse-rotate attention output back to original space
-    if (k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
+    // TurboQuant: inverse-rotate attention output back to original space.
+    // Gated on v->type: SET_ROWS stores a turbo V as R_V v (V sign vectors), so the output is
+    // R_V o and GGML_OP_TURBO_WHT direction 1 applies R_V^T. The rotation of Q (K's R_K) cancels
+    // inside the scores and never reaches the output, so a plain V needs no inverse, also when K is turbo.
+    if (v && llama_turbo_kv_type(v->type)) {
         if (cur->ne[0] % 128 == 0) {
             if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
             cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse

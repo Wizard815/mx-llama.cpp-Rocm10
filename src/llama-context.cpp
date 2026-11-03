@@ -524,13 +524,13 @@ llama_context::llama_context(
             }
         }
 
-        // turbo2/turbo3/turbo4 stores KV in FWHT-rotated space — requires FA for Q pre-rotation.
+        // turbo2/3/4/5/6 stores KV in FWHT-rotated space — requires FA for Q pre-rotation.
         {
-            const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0);
-            const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0);
+            const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO5_0 || params.type_k == GGML_TYPE_TURBO6_0);
+            const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO5_0 || params.type_v == GGML_TYPE_TURBO6_0);
             if ((turbo_k || turbo_v) && !cparams.flash_attn) {
                 throw std::runtime_error(
-                    "turbo2/turbo3/turbo4 KV cache requires Flash Attention (stores data in FWHT-rotated space). "
+                    "turbo2/3/4/5/6 KV cache requires Flash Attention (stores data in FWHT-rotated space). "
                     "Use -fa on (or -fa auto, which is the default).");
             }
         }
@@ -4651,10 +4651,10 @@ llama_context * llama_init_from_model(
         }
     }
 
-    // turbo2/turbo3/turbo4 stores KV in FWHT-rotated space — requires FA for Q pre-rotation.
+    // turbo2/3/4/5/6 stores KV in FWHT-rotated space — requires FA for Q pre-rotation.
     if (params.type_k == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO2_0 ||
         params.type_k == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO3_0 ||
-        params.type_k == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO4_0) {
+        params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO5_0 || params.type_k == GGML_TYPE_TURBO6_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO5_0 || params.type_v == GGML_TYPE_TURBO6_0) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
             LLAMA_LOG_WARN("%s: turbo cache types require flash attention - forcing on\n", __func__);
         }
