@@ -453,6 +453,31 @@ void launch_mul_mat_vec_f_cuda(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
+
+#if defined(GGML_USE_HIP)
+    // GCN: with fewer blocks than 2x the CU count (e.g. ssm_alpha/ssm_beta, 32-48 rows) the 128-thread cap
+    // leaves most CUs idle; give each long row 512/1024 threads so more loads are in flight.
+    // GGML_CUDA_FEWROW_F32: 0 = off, 1 = auto (default), 512 or 1024 = force that block size.
+    if constexpr (std::is_same_v<T, float>) {
+        static const int fewrow_env = [] {
+            const char * value = getenv("GGML_CUDA_FEWROW_F32");
+            return value != nullptr ? atoi(value) : 1;
+        }();
+        const int64_t nsm     = ggml_cuda_info().devices[device].nsm;
+        const int64_t nblocks = nrows * nchannels_dst * nsamples_or_ntokens;
+        if (fewrow_env != 0 && warp_size == 64 && GGML_CUDA_CC_IS_GCN(ggml_cuda_info().devices[device].cc) && nblocks < 2*nsm) {
+            if (fewrow_env == 512 || fewrow_env == 1024) {
+                if (ncols/2 >= fewrow_env) {
+                    block_size_best = fewrow_env;
+                }
+            } else if (ncols/2 >= 2048) {
+                block_size_best = 1024;
+            } else if (ncols/2 >= 1024) {
+                block_size_best = 512;
+            }
+        }
+    }
+#endif // defined(GGML_USE_HIP)
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(block_size_best, 1, 1);
     switch (block_size_best) {
@@ -504,6 +529,28 @@ void launch_mul_mat_vec_f_cuda(
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
+#if defined(GGML_USE_HIP)
+        case  512: {
+            if constexpr (std::is_same_v<T, float>) {
+                mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 512, is_multi_token_id>
+                    (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
+            } else {
+                GGML_ABORT("fatal error");
+            }
+        } break;
+        case 1024: {
+            if constexpr (std::is_same_v<T, float>) {
+                mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 1024, is_multi_token_id>
+                    (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
+            } else {
+                GGML_ABORT("fatal error");
+            }
+        } break;
+#endif // defined(GGML_USE_HIP)
         default: {
             GGML_ABORT("fatal error");
         } break;

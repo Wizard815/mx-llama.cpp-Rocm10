@@ -10928,6 +10928,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1, 509, 2051, {1, 1}, {1, 1}));
 
+    // few-row F32 mat-vec (ssm_alpha/ssm_beta, router/shared-expert gates) at decode batch sizes:
+    // the GCN few-row path (GGML_CUDA_FEWROW_F32) picks 512 threads for 2048 <= k < 4096, 1024 for k >= 4096
+    for (int64_t m : {1, 32, 48, 64}) {
+        for (int64_t k : {2048, 5120}) {
+            for (int64_t n : {1, 2, 4, 8}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 3, 4096, {2, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 2050, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 31, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
@@ -12475,6 +12486,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
     }
 
+    // Qwen3.5/3.6-35B-A3B decode: ssm_alpha/ssm_beta (32 x 2048 F32), shared-expert gate (1 x 2048),
+    // router (256 x 2048) at 1..4 tokens
+    for (int64_t m : {1, 32, 256}) {
+        for (int64_t n : {1, 4}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, n, 2048, {1, 1}, {1, 1}));
+        }
+    }
     // Qwen3.5/3.6-35B-A3B linear-attention prefill (16 key heads, 32 value heads, head size 128),
     // the shape scripts/gfx906-gdn-sweep.sh tunes the chunked Gated DeltaNet kernel for.
     for (int n_tokens : { 1024, 2048 }) {
