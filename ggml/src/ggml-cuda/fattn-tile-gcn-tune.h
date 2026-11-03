@@ -6,3 +6,4 @@
 // rewrites this file per candidate and restores it afterwards. Example:
 //
 //   #define GGML_FATTN_TILE_GCN_256_32 256, 2, 32, 128
+//   #define GGML_FATTN_TILE_GCN_256_16 256, 2, 64, 32   // also 128_32, 64_32
