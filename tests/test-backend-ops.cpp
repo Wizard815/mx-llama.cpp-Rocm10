@@ -12164,6 +12164,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
 
+    // decode / speculative-verify shapes at head size 128 (16 key, 32 value heads), the serial kernel's
+    // case-128 path (GGML_CUDA_GDN_DECODE_MC=1 switches it to the full-warp multi-column layout on GCN)
+    for (int64_t n_tokens : {1, 2, 3, 4}) {
+        for (int64_t K : {1, 4}) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 2, false, false, K));
+        }
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2, 2, 2, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 6, 2, 2, false, false, /*K=*/4)); // n_tokens > K
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  2, 128, 3, 1, 1, false, false, /*K=*/4)); // few heads: fewer warps per CTA
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4, 1, 2, true,  false, /*K=*/4)); // permuted q/k/v
+
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
@@ -12487,11 +12499,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // Qwen3.5/3.6-35B-A3B decode: ssm_alpha/ssm_beta (32 x 2048 F32), shared-expert gate (1 x 2048),
-    // router (256 x 2048) at 1..4 tokens
+    // router (256 x 2048) at 1..4 tokens, and the serial GDN kernel at 1..4 tokens with K = 4 snapshots
     for (int64_t m : {1, 32, 256}) {
         for (int64_t n : {1, 4}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, n, 2048, {1, 1}, {1, 1}));
         }
+    }
+    for (int n_tokens : { 1, 4 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 2, false, false, 1));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 2, false, false, 4));
     }
     // Qwen3.5/3.6-35B-A3B linear-attention prefill (16 key heads, 32 value heads, head size 128),
     // the shape scripts/gfx906-gdn-sweep.sh tunes the chunked Gated DeltaNet kernel for.
