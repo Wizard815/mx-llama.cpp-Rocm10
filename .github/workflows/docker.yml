@@ -196,6 +196,7 @@ jobs:
 
           REPO_OWNER="${GITHUB_REPOSITORY_OWNER@L}"  # to lower case
           REPO_NAME="${{ github.event.repository.name }}"
+          REPO_NAME="${REPO_NAME@L}"  # to lower case
           IMAGE_REPO="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
           PREFIX="${IMAGE_REPO}:"
           PLATFORM="${{ matrix.config.platforms }}"
@@ -447,6 +448,7 @@ jobs:
 
           REPO_OWNER="${GITHUB_REPOSITORY_OWNER@L}"  # to lower case
           REPO_NAME="${{ github.event.repository.name }}"
+          REPO_NAME="${REPO_NAME@L}"  # to lower case
           IMAGE_REPO="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
           PREFIX="${IMAGE_REPO}:"
           SRC_TAG="${{ needs.create_tag.outputs.source_tag }}"
