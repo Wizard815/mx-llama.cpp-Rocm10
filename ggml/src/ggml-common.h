@@ -325,6 +325,29 @@ typedef struct {
 } block_turbo2_0;                // 10 bytes total
 static_assert(sizeof(block_turbo2_0) == sizeof(ggml_half) + QK_TURBO2/4, "wrong turbo2_0 block size");
 
+// TurboQuant 6-bit: 6-bit PolarQuant, 64 Lloyd-Max centroids for N(0, 1/128), no QJL.
+// Per block: corrected norm(fp16) + low 4 bits (64 bytes) + high 2 bits (32 bytes)
+// = 98 bytes per 128 values = 6.125 bits/value. Split planes so value pairs share one qs byte.
+#define QK_TURBO6 128
+typedef struct {
+    ggml_half  norm;                 //  2 bytes: corrected L2 norm of the 128-value group
+    uint8_t    qs[QK_TURBO6 / 2];    // 64 bytes: low 4 bits of each 6-bit code (value j in nibble j%2 of qs[j/2])
+    uint8_t    qh[QK_TURBO6 / 4];    // 32 bytes: high 2 bits of each code (value j at bits 2*(j%4) of qh[j/4])
+} block_turbo6_0;                    // 98 bytes total
+static_assert(sizeof(block_turbo6_0) == sizeof(ggml_half) + QK_TURBO6/2 + QK_TURBO6/4, "wrong turbo6_0 block size/padding");
+
+// TurboQuant 5-bit: 32 antisymmetric Lloyd-Max centroids c[0..31] for N(0, 1/128) (c[31-i] == -c[i]),
+// stored sign-magnitude: qs[] holds the 4-bit magnitude index m (|value| = c[16+m] * norm) and qh[]
+// the sign bit (1 = negative). Centroid code = neg ? 15-m : 16+m.
+// Per block: corrected norm(fp16) + 64 + 16 bytes = 82 bytes per 128 values = 5.125 bits/value.
+#define QK_TURBO5 128
+typedef struct {
+    ggml_half  norm;                 //  2 bytes: corrected L2 norm of the 128-value group
+    uint8_t    qs[QK_TURBO5 / 2];    // 64 bytes: magnitude index (value j in nibble j%2 of qs[j/2])
+    uint8_t    qh[QK_TURBO5 / 8];    // 16 bytes: sign bit (value j at bit j%8 of qh[j/8])
+} block_turbo5_0;                    // 82 bytes total
+static_assert(sizeof(block_turbo5_0) == sizeof(ggml_half) + QK_TURBO5/2 + QK_TURBO5/8, "wrong turbo5_0 block size/padding");
+
 //
 // Super-block quantization structures
 //

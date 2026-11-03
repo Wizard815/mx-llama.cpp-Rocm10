@@ -212,6 +212,38 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+// TurboQuant 5/6-bit: dequantize one 128-value block at a time and dot with the f32 operand.
+// Used by the CPU FlashAttention reference (K stays in the WHT-rotated domain, like Q).
+static void ggml_vec_dot_turbo56_f32(enum ggml_type type, int n, float * GGML_RESTRICT s,
+                                     const void * GGML_RESTRICT vx, const float * GGML_RESTRICT y) {
+    const struct ggml_type_traits * tr = ggml_get_type_traits(type);
+    const int64_t bs = tr->blck_size;
+    GGML_ASSERT(n % bs == 0 && bs <= 128);
+    float tmp[128];
+    ggml_float sum = 0.0;
+    for (int64_t ib = 0; ib < n / bs; ++ib) {
+        tr->to_float((const char *) vx + ib*tr->type_size, tmp, bs);
+        for (int64_t j = 0; j < bs; ++j) {
+            sum += (ggml_float) tmp[j] * (ggml_float) y[ib*bs + j];
+        }
+    }
+    *s = (float) sum;
+}
+
+static void ggml_vec_dot_turbo5_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx,
+                                      const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by);
+    ggml_vec_dot_turbo56_f32(GGML_TYPE_TURBO5_0, n, s, vx, (const float *) vy);
+}
+
+static void ggml_vec_dot_turbo6_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx,
+                                      const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by);
+    ggml_vec_dot_turbo56_f32(GGML_TYPE_TURBO6_0, n, s, vx, (const float *) vy);
+}
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -229,6 +261,17 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_q1_0,
         .vec_dot                  = ggml_vec_dot_q1_0_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    // no from_float: the cache is written WHT-rotated by the GPU SET_ROWS kernels only
+    [GGML_TYPE_TURBO5_0] = {
+        .vec_dot                  = ggml_vec_dot_turbo5_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO6_0] = {
+        .vec_dot                  = ggml_vec_dot_turbo6_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q2_0] = {
@@ -2089,6 +2132,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_TURBO_WHT:
+            {
+                ggml_compute_forward_turbo_wht(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2285,6 +2332,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_TURBO_WHT:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
