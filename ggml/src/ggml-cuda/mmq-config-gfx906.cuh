@@ -2,10 +2,12 @@
 //
 // Everything but MXFP4 takes upstream's GCN table, which carries the same Q8_0 tuning this file used to hold (8 warps, tile widths to J=128) and is faster on Q4_0.
 // The wide Q8_0 tiles are only SELECTED when they keep the CUs busy, see the gfx906 occupancy gate in the host tile-width loop (mmq.cu).
+// The GCN table is upstream PR #30021's retune (8 warps and J=24/40/48 tiles for the small-batch boundaries);
+// -DGGML_CUDA_GCN_MMQ_LEGACY builds the previous one instead (mmq-config-gcn-legacy.cuh). The overrides below apply to both.
 //
 // MXFP4 keeps 8 warps over the rdna2 tile layout, the configuration measured on MI50.
 // Q5_K at J=64 uses I=64 instead of the GCN table's I=128: ~15-35% faster on MI50 (mixa3607/ML-gfx906, mxxm-gfx906-kcase.patch).
-// Perf-only knobs, results are bit-exact. Include after mmq-config-gcn.cuh and mmq-config-rdna2.cuh.
+// Perf-only knobs, results are bit-exact. Include after the GCN and rdna2 tables.
 static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_gfx906(ggml_type type, int J, bool fallback) {
     if (type == GGML_TYPE_MXFP4) {
         const ggml_cuda_mmq_config rdna2 = ggml_cuda_mmq_get_config_rdna2(type, J, fallback);

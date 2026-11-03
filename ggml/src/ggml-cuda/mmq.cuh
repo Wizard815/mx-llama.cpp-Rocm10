@@ -218,7 +218,12 @@ struct ggml_cuda_mmq_config {
 #include "mmq-config-ampere.cuh"
 #include "mmq-config-blackwell.cuh"
 
+// GGML_CUDA_GCN_MMQ_LEGACY restores the pre-#30021 GCN table (also used by gfx906), for A/B on hardware.
+#ifdef GGML_CUDA_GCN_MMQ_LEGACY
+#include "mmq-config-gcn-legacy.cuh"
+#else
 #include "mmq-config-gcn.cuh"
+#endif // GGML_CUDA_GCN_MMQ_LEGACY
 #include "mmq-config-cdna.cuh"
 #include "mmq-config-rdna2.cuh"
 #include "mmq-config-rdna3.cuh"
@@ -443,6 +448,7 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __de
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
+    static_assert(I % warp_size == 0, "DP4A MMQ tile height must be a multiple of the physical warp size");
 
     const bool y_scale_used = y_scale != nullptr;
 

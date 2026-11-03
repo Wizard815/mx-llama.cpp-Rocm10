@@ -28,6 +28,15 @@ plus these later ggml-org/llama.cpp commits cherry-picked for HIP/GCN:
 - `ggml/src/ggml-cuda/mmq-config-gfx906.cuh` - one MI50-measured Q5_K J=64 tile override
   (I=64 vs the GCN table's I=128, +15-35% measured) from mixa3607/ML-gfx906's
   `mxxm-gfx906-kcase.patch`
+- `mmq-config-gcn.cuh` - GCN MMQ retune from llama.cpp draft PR #30021 (8-wave tiles and J=24/40/48
+  rows at small batch sizes, dp4a only; also used by gfx906 under the overrides above). Only matters
+  for weights MMQ sees: types the repack buffer does not take (Q4_0, Q4_1, Q5_0, Q2_K, Q3_K, IQ1-3,
+  IQ4_XS, ...) and every type under `--no-repack`. `-DGGML_HIP_GCN_MMQ_LEGACY=ON` builds the previous
+  table (`mmq-config-gcn-legacy.cuh`) for A/B. Plus the #30837 static_assert (DP4A tile height must
+  be a multiple of the warp size).
+- `-DGGML_FATTN_TILE_GCN_UPSTREAM_30344` (in `CMAKE_HIP_FLAGS`) opts into the two FA tile rows of
+  llama.cpp draft PR #30344 the gfx906 default lacks: (256,256,16) and (64,64,32) = 256,2,64,32.
+  Off by default, not measured on MI50.
 - `GGML_OP_SOLVE_TRI` crash fix - gfx906's rocBLAS `strsm` has no gfx906 kernel, so for
   n > 64 or k > 32 the op is reported unsupported on gfx906 and runs on the CPU instead of
   crashing (affects Gated Delta Network models: Qwen3.5, Qwen3-Next, Kimi Linear)

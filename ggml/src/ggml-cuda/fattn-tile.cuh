@@ -317,6 +317,16 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
 // scripts/gfx906-fattn-tile-sweep.sh tries configs without editing this file.
 // Each override is "nthreads, occupancy, nbatch_fa, nbatch_K" for one (DKQ, DV, ncols).
 #include "fattn-tile-gcn-tune.h"
+// Opt-in: -DGGML_FATTN_TILE_GCN_UPSTREAM_30344 adds the two rows of upstream PR #30344 that the gfx906 default does not
+// already have ((256, 256, 32) = 256, 2, 64, 64 is the same in both). Unmeasured on MI50, off by default.
+#ifdef GGML_FATTN_TILE_GCN_UPSTREAM_30344
+#ifndef GGML_FATTN_TILE_GCN_256_16
+#define GGML_FATTN_TILE_GCN_256_16 256, 2, 64, 32
+#endif
+#ifndef GGML_FATTN_TILE_GCN_64_32
+#define GGML_FATTN_TILE_GCN_64_32  256, 2, 64, 32
+#endif
+#endif // GGML_FATTN_TILE_GCN_UPSTREAM_30344
 #define GGML_CUDA_FATTN_TILE_CONFIG_CASE_EXPAND(...) GGML_CUDA_FATTN_TILE_CONFIG_CASE(__VA_ARGS__)
 
 static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_amd_gcn(const int DKQ, const int DV, const int ncols) {
@@ -331,6 +341,9 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
 #endif
 #ifdef GGML_FATTN_TILE_GCN_128_32
     GGML_CUDA_FATTN_TILE_CONFIG_CASE_EXPAND(128, 128, 32, GGML_FATTN_TILE_GCN_128_32)
+#endif
+#ifdef GGML_FATTN_TILE_GCN_64_32
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE_EXPAND( 64,  64, 32, GGML_FATTN_TILE_GCN_64_32)
 #endif
     return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
 }
