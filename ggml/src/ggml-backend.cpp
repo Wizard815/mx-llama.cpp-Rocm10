@@ -2375,8 +2375,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         bool input_staging_event_needs_record = false;
 
         // ensure the previous split's async work has completed before we start
-        // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        // this split, the allocator may have reused buffer regions across splits.
+        // Only regions of this split's own backend compute buffer type can be
+        // overwritten here, so the barrier is needed only when an input of the
+        // previous split lives in a buffer of that type (or has no buffer). The
+        // unconditional barrier made every CPU split after a GPU split wait for
+        // the GPU (MoE experts on CPU: about -9.5% decode, from yuffx/y-llama.cpp).
+        // GGML_SCHED_BARRIER_ALWAYS=1 restores the unconditional barrier.
+        const auto prev_reads_buffer_of_split_backend = [&]() {
+            static const bool always = [] {
+                const char * e = getenv("GGML_SCHED_BARRIER_ALWAYS");
+                return e != nullptr && atoi(e) != 0;
+            }();
+            if (always || split_id == 0) {
+                return true;
+            }
+            const struct ggml_backend_sched_split * prev = &splits[split_id - 1];
+            for (int j = 0; j < prev->n_inputs; j++) {
+                const struct ggml_tensor * in = prev->inputs[j];
+                ggml_backend_buffer_t buf = in->view_src ? in->view_src->buffer : in->buffer;
+                if (!buf || ggml_backend_buffer_get_type(buf) == sched->bufts[split_backend_id]) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id &&
+                prev_reads_buffer_of_split_backend()) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
