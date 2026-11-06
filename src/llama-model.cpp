@@ -512,7 +512,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "") -> tensor_config {
         // the layers in a tensor can be inhomogeneous, if the pattern is cleanly divided by the number of GPUs there can be aliasing effects,
         //     count only the same type of previous layers to avoid this
-        auto get_il_eff = [&](const size_t il){
+        auto get_il_eff = [&](size_t il){
+            // a layer without its own KV reads the KV of the last earlier layer of its type, so it needs that layer's rotation
+            if (hparams.n_layer_kv_from_start >= 2 && il >= (size_t) hparams.n_layer_kv_from_start) {
+                il = hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
+            }
             size_t ret = 0;
             const bool il_is_recr = hparams.is_recr(il);
             const bool il_is_swa  = hparams.is_swa(il);
