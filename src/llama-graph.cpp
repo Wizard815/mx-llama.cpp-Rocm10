@@ -1723,6 +1723,38 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+ggml_tensor * llm_graph_context::build_mtp_draft_head(
+          ggml_tensor * w,
+          ggml_tensor * cur,
+          ggml_tensor * w_s,
+                 bool   tensor_split) const {
+    static const int64_t draft_vocab = [] {
+        const char * e = getenv("LLAMA_MTP_DRAFT_VOCAB");
+        return e ? atoll(e) : 0;
+    }();
+    const int64_t n_vocab_head = w->ne[1];
+    bool use_prefix = draft_vocab > 0 && draft_vocab < n_vocab_head && !tensor_split && w_s == nullptr &&
+        ggml_is_contiguous(w);
+    // The gfx906 repacked layout splices views only for its single-plane types (Q8_0,
+    // MXFP4); a K-quant head in that buffer keeps the full projection.
+    if (use_prefix && w->buffer != nullptr) {
+        const char * buft = ggml_backend_buft_name(ggml_backend_buffer_get_type(w->buffer));
+        if (buft != nullptr && strstr(buft, "_Repacked") != nullptr &&
+                w->type != GGML_TYPE_Q8_0 && w->type != GGML_TYPE_MXFP4) {
+            use_prefix = false;
+        }
+    }
+    if (!use_prefix) {
+        return build_lora_mm(w, cur, w_s);
+    }
+    ggml_tensor * w_sub = ggml_view_2d(ctx0, w, w->ne[0], draft_vocab, w->nb[1], 0);
+    cur = build_lora_mm(w_sub, cur, nullptr);
+    cur = ggml_scale_bias(ctx0, cur, 1.0f, 1.0e4f);
+    cur = ggml_pad(ctx0, cur, (int) (n_vocab_head - draft_vocab), 0, 0, 0);
+    cur = ggml_scale_bias(ctx0, cur, 1.0f, -1.0e4f);
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,

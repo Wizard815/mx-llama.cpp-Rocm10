@@ -1115,6 +1115,17 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
 
+    // MTP draft LM head. LLAMA_MTP_DRAFT_VOCAB=K scores only the first K token ids (the
+    // frequent BPE merges) and pads the rest to n_vocab, 1e4 below the real scores. The
+    // target still scores the full vocabulary and verifies every draft, so this changes
+    // draft acceptance only, never the output. Not used under -sm tensor (the head is
+    // split along the vocabulary there). From benpeterson40/castagna-veloce.
+    ggml_tensor * build_mtp_draft_head(
+              ggml_tensor * w,
+              ggml_tensor * cur,
+              ggml_tensor * w_s,
+                     bool   tensor_split) const;
+
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
     ggml_tensor * build_lora_mm_id(
