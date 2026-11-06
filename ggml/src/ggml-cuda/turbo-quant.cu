@@ -430,12 +430,12 @@ static void turbo_init_rotation_device() {
     //
     // Actually: just upload R^T and use it. The kernel will compute y[i] = sum_j RT[j][i] * x[j]
     // which equals y = R * x where R = (R^T)^T.
-    hipMalloc(&d_rotation_k, 128*128*sizeof(float));
-    hipMemcpy(d_rotation_k, TURBO_ROTATION_RT, 128*128*sizeof(float), hipMemcpyHostToDevice);
+    CUDA_CHECK(cudaMalloc(&d_rotation_k, 128*128*sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_rotation_k, TURBO_ROTATION_RT, 128*128*sizeof(float), cudaMemcpyHostToDevice));
 
     // For inverse: y = R^T * x, just use R^T directly: y[i] = sum_j RT[i][j] * x[j]
-    hipMalloc(&d_rotation_k_inv, 128*128*sizeof(float));
-    hipMemcpy(d_rotation_k_inv, TURBO_ROTATION_RT, 128*128*sizeof(float), hipMemcpyHostToDevice);
+    CUDA_CHECK(cudaMalloc(&d_rotation_k_inv, 128*128*sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_rotation_k_inv, TURBO_ROTATION_RT, 128*128*sizeof(float), cudaMemcpyHostToDevice));
 
     // TODO: V rotation uses different seed — for now use same as K
     d_rotation_v = d_rotation_k;
