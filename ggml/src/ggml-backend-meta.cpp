@@ -1000,6 +1000,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
+        // A replicated matrix on an operand one device owns whole, as the KV Hadamard rotation of a single-head K/V: the owner computes all of it.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                src_ss[1].n_segments == 1 && src_ss[1].nr[0] == 1) {
+            bool complete_rows = true;
+            for (size_t j = 0; j < n_bufs; j++) {
+                const int64_t ne = src_ss[1].ne[j];
+                complete_rows = complete_rows && (ne == 0 || ne == tensor->src[1]->ne[0]);
+            }
+            if (complete_rows) {
+                return src_ss[1];
+            }
+        }
         GGML_ABORT("unsupported mul_mat split states: node=%s src0=%s axis=%d src1=%s axis=%d",
             tensor->name, tensor->src[0]->name, (int) src_ss[0].axis, tensor->src[1]->name, (int) src_ss[1].axis);
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
@@ -1017,6 +1029,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 }
                 if (src_ss[0].n_segments == 1) {
                     base_ne_in /= src_ss[0].nr[0];
+                    // a VIEW that keeps the shape (the one-token KV write) stays on dim 0, matching the cache
+                    const bool same_shape_view = tensor->op == GGML_OP_VIEW && tensor->src[0]->ne[1] == 1;
+                    if (!same_shape_view && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && tensor->ne[0] == tensor->src[0]->ne[0] &&
+                            tensor->ne[1] == 1 && src_ss[0].nr[0] == 1) {
+                        bool complete_rows = true;
+                        for (size_t j = 0; j < n_bufs; j++) {
+                            const int64_t ne = src_ss[0].ne[j];
+                            complete_rows = complete_rows && (ne == 0 || ne == tensor->src[0]->ne[0]);
+                        }
+                        if (complete_rows) {
+                            // Move a complete dim-0 split to the following singleton dimension. Checked before the fold
+                            // below, which a one-token [head_dim, 1] would otherwise match since ggml_n_dims drops the 1.
+                            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+                        }
+                    }
                     if (src_ss[0].axis == ggml_n_dims(tensor->src[0]) - 1 && src_ss[0].nr[0] == 1) {
                         // A fold of the split trailing dim INTO dim 0 moves the split to dim 0.
                         // qwen4exp's PLE gather is [head_dim, n_heads*n_tokens] split by head
@@ -1038,18 +1065,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                             }
                         }
                         return {ggml_backend_meta_split_axis(ggml_n_dims(tensor) - 1), {0}, {1}, 1};
-                    }
-                    if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && tensor->ne[0] == tensor->src[0]->ne[0] &&
-                            tensor->ne[1] == 1 && src_ss[0].nr[0] == 1) {
-                        bool complete_rows = true;
-                        for (size_t j = 0; j < n_bufs; j++) {
-                            const int64_t ne = src_ss[0].ne[j];
-                            complete_rows = complete_rows && (ne == 0 || ne == tensor->src[0]->ne[0]);
-                        }
-                        if (complete_rows) {
-                            // Move a complete dim-0 split to the following singleton dimension.
-                            return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
-                        }
                     }
                 }
                 // Reshape outputs use one segment; split-state propagation merges source segments.
