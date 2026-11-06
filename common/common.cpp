@@ -1687,15 +1687,22 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     // Carry the DSpark output-layout choice with this model load. A process-wide
     // environment variable can be overwritten while another model is loading.
     static constexpr const char * tensor_mirror_output_key = "mxxm.tensor_mirror_output";
-    // DSpark needs the mirrored output for its own reasons; MTP needs it so the
-    // backend sampler can run under -sm tensor (see llama_context::set_sampler).
+    // DSpark needs the mirrored output for its own reasons (its head argmaxes the
+    // logits inside the graph). MTP can use it so the backend sampler runs under
+    // -sm tensor (see llama_context::set_sampler), but the mirror replicates the
+    // TARGET output matrix too: every lane then reads the whole lm_head on each
+    // verify and draft step instead of 1/tps of it. With a ~250k vocabulary that
+    // costs more than the CPU sampler saves, so it is opt-in for MTP:
+    // LLAMA_MTP_TENSOR_MIRROR=1 enables it.
     const bool has_dspark =
         std::find(params.speculative.types.begin(), params.speculative.types.end(),
                   COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
     const bool has_mtp =
         std::find(params.speculative.types.begin(), params.speculative.types.end(),
                   COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-    const bool tensor_mirror_output = has_dspark || has_mtp;
+    const char * mtp_mirror_env = std::getenv("LLAMA_MTP_TENSOR_MIRROR");
+    const bool mtp_mirror = has_mtp && mtp_mirror_env != nullptr && std::atoi(mtp_mirror_env) != 0;
+    const bool tensor_mirror_output = has_dspark || mtp_mirror;
 
     // Target-side repacking changes the verification rounding enough to lower
     // DSpark acceptance on gfx906. The draft already loads without extra buffer
