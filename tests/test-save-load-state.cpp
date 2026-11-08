@@ -613,7 +613,10 @@ static bool test_state_restore_failure(struct llama_model * model, const struct 
     params_ctx.kv_unified = true;
 
     // without flash attention, corrupted data left behind by the restore shows up as NaN logits on the other sequences
-    params_ctx.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    // (tensor split and a quantized V cache require flash attention)
+    if (params.split_mode != LLAMA_SPLIT_MODE_TENSOR && !ggml_is_quantized(params_ctx.type_v)) {
+        params_ctx.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
 
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
     if (!ctx) {

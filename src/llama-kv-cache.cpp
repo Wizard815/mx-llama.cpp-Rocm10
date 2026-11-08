@@ -506,8 +506,82 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    init_rotation(name_tag);
+
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+}
+
+void llama_kv_cache::init_rotation(const char * name_tag) {
+    if (hparams.no_alloc || !(n_rot_k || n_rot_v)) {
+        return;
+    }
+
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctx_map;
+    for (auto & layer : layers) {
+        for (bool is_k : { true, false }) {
+            const uint32_t n_rot = is_k ? n_rot_k : n_rot_v;
+            auto * cache = is_k ? layer.k : layer.v;
+            if (!n_rot || !cache || !cache->buffer || attn_rot_hadamard.count(n_rot) == 0) {
+                continue;
+            }
+
+            const auto buft = ggml_backend_buffer_get_type(cache->buffer);
+            auto & ctx = ctx_map[buft];
+            if (!ctx) {
+                ggml_init_params params = { 2*layers.size()*ggml_tensor_overhead(), nullptr, true };
+                ctx.reset(ggml_init(params));
+                if (!ctx) {
+                    throw std::runtime_error("failed to create ggml context for rotation matrices");
+                }
+            }
+
+            auto * rot = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_rot, n_rot);
+            ggml_format_name(rot, "cache_%s%s_rot_l%d", name_tag, is_k ? "k" : "v", layer.il);
+            (is_k ? layer.k_rot : layer.v_rot) = rot;
+        }
+    }
+
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            throw std::runtime_error("failed to allocate buffer for rotation matrices");
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        attn_rot_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    for (const auto & layer : layers) {
+        for (auto * t : { layer.k_rot, layer.v_rot }) {
+            if (t) {
+                ggml_backend_tensor_set(t, attn_rot_hadamard.at(t->ne[0]).data(), 0, ggml_nbytes(t));
+            }
+        }
+    }
+}
+
+ggml_tensor * llama_kv_cache::get_k_rot(int32_t il, ggml_tensor * fallback) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return fallback;
+    }
+
+    // with shared KV under -sm layer, the KV owner can sit on another device than il: using the
+    // resident matrix there would pull the Hadamard product over to the owner's device
+    const auto & layer = layers[it->second];
+    return layer.k_rot && model.dev_layer(il) == model.dev_layer(layer.il) ? layer.k_rot : fallback;
+}
+
+ggml_tensor * llama_kv_cache::get_v_rot(int32_t il, ggml_tensor * fallback) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return fallback;
+    }
+
+    // with shared KV under -sm layer, the KV owner can sit on another device than il: using the
+    // resident matrix there would pull the Hadamard product over to the owner's device
+    const auto & layer = layers[it->second];
+    return layer.v_rot && model.dev_layer(il) == model.dev_layer(layer.il) ? layer.v_rot : fallback;
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -2917,8 +2991,12 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         }
     }
 
-    for (const auto & r : runs) {
-        sync_replicas(strm, r.from, r.to);
+    if (!replicas.empty()) {
+        io.after_apply([this, strm, runs]() {
+            for (const auto & r : runs) {
+                sync_replicas(strm, r.from, r.to);
+            }
+        });
     }
 
     return true;
@@ -3197,6 +3275,14 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_pos_bucket(dst, ubatch);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_rot(int32_t il, ggml_tensor * fallback) const {
+    return kv->get_k_rot(il, fallback);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_rot(int32_t il, ggml_tensor * fallback) const {
+    return kv->get_v_rot(il, fallback);
 }
 
 void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {

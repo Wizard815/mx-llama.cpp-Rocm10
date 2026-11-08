@@ -1461,6 +1461,12 @@ struct llm_graph_context {
             ggml_tensor * cls_norm) const;
 
     //
+    // logits
+    //
+
+    void build_logits() const;
+
+    //
     // sampling (backend sampling)
     //
 

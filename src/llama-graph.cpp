@@ -1175,7 +1175,7 @@ void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
 
-    if (self_k_rot) {
+    if (self_k_rot && self_k_rot->buffer) {
         mctx->set_input_k_rot(self_k_rot);
     }
 }
@@ -1278,11 +1278,11 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
-    if (inp_attn->self_k_rot) {
+    if (inp_attn->self_k_rot && inp_attn->self_k_rot->buffer) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
     }
 
-    if (inp_attn->self_v_rot) {
+    if (inp_attn->self_v_rot && inp_attn->self_v_rot->buffer) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
@@ -1386,19 +1386,19 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_swa()->set_input_kq_mask(inp_attn->self_kq_mask_swa, ubatch, cparams.causal_attn);
     }
 
-    if (inp_attn->self_k_rot) {
+    if (inp_attn->self_k_rot && inp_attn->self_k_rot->buffer) {
         attn_ctx->get_base()->set_input_k_rot(inp_attn->self_k_rot);
     }
 
-    if (inp_attn->self_v_rot) {
+    if (inp_attn->self_v_rot && inp_attn->self_v_rot->buffer) {
         attn_ctx->get_base()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
-    if (inp_attn->self_k_rot_swa) {
+    if (inp_attn->self_k_rot_swa && inp_attn->self_k_rot_swa->buffer) {
         attn_ctx->get_swa()->set_input_k_rot(inp_attn->self_k_rot_swa);
     }
 
-    if (inp_attn->self_v_rot_swa) {
+    if (inp_attn->self_v_rot_swa && inp_attn->self_v_rot_swa->buffer) {
         attn_ctx->get_swa()->set_input_v_rot(inp_attn->self_v_rot_swa);
     }
 
@@ -3276,13 +3276,16 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
-    if (inp->self_k_rot) {
-        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
-        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    auto * k_rot = inp->mctx->get_k_rot(il, inp->self_k_rot);
+    auto * v_rot = inp->mctx->get_v_rot(il, inp->self_v_rot);
+
+    if (k_rot) {
+        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
     }
 
-    if (inp->self_v_rot) {
-        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    if (v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -3340,8 +3343,8 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
-    if (inp->self_v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+    if (v_rot) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
     }
 
     if (wo) {
@@ -3372,11 +3375,13 @@ void llm_graph_context::build_attn_store_kv(
     // Mirrors the K/V-store block of build_attn (above) exactly: apply the optional fused
     // K/V rotation, expand, then write into the KV cache via cpy_k/cpy_v. No attention,
     // wo, or output is built - the MTP head's prefill replay only needs the prompt K/V stored.
-    if (inp->self_k_rot) {
-        k_cur = ggml_mul_mat_aux(ctx0, k_cur, inp->self_k_rot);
+    auto * k_rot = inp->mctx->get_k_rot(il, inp->self_k_rot);
+    auto * v_rot = inp->mctx->get_v_rot(il, inp->self_v_rot);
+    if (k_rot) {
+        k_cur = ggml_mul_mat_aux(ctx0, k_cur, k_rot);
     }
-    if (inp->self_v_rot) {
-        v_cur = ggml_mul_mat_aux(ctx0, v_cur, inp->self_v_rot);
+    if (v_rot) {
+        v_cur = ggml_mul_mat_aux(ctx0, v_cur, v_rot);
     }
 
     ggml_build_forward_expand(gf, v_cur);
@@ -3569,8 +3574,10 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     const bool is_swa = hparams.is_swa(il);
 
-    auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
-    auto * v_rot = is_swa ? inp->self_v_rot_swa : inp->self_v_rot;
+    const auto * mctx_rot = is_swa ? inp->mctx->get_swa() : inp->mctx->get_base();
+
+    auto * k_rot = mctx_rot->get_k_rot(il, is_swa ? inp->self_k_rot_swa : inp->self_k_rot);
+    auto * v_rot = mctx_rot->get_v_rot(il, is_swa ? inp->self_v_rot_swa : inp->self_v_rot);
 
     if (k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
@@ -3683,7 +3690,9 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     const bool is_swa = hparams.is_swa(il);
 
-    auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
+    const auto * mctx_rot = is_swa ? inp->mctx->get_swa() : inp->mctx->get_base();
+
+    auto * k_rot = mctx_rot->get_k_rot(il, is_swa ? inp->self_k_rot_swa : inp->self_k_rot);
 
     if (k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
@@ -4302,6 +4311,18 @@ void llm_graph_context::build_pooling(
     res->t_embd_pooled = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+void llm_graph_context::build_logits() const {
+    // a pooled embeddings context outputs one vector per sequence, so its graph skips the LM head
+    if (cparams.embeddings && pooling_type != LLAMA_POOLING_TYPE_NONE) {
+        res->t_logits = nullptr;
+    }
+
+    // the models declare t_logits without expanding it, so the LM head is computed only when it is expanded here
+    if (res->t_logits != nullptr) {
+        ggml_build_forward_expand(gf, res->t_logits);
+    }
 }
 
 void llm_graph_context::build_sampling() const {
