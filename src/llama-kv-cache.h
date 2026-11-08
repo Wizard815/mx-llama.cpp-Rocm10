@@ -251,6 +251,10 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
+    // the rotation resident on the layer's device, or fallback (the host input) if it has none
+    ggml_tensor * get_k_rot(int32_t il, ggml_tensor * fallback) const;
+    ggml_tensor * get_v_rot(int32_t il, ggml_tensor * fallback) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
@@ -287,7 +291,13 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // resident rotation matrices, on the device of k/v
+        ggml_tensor * k_rot = nullptr;
+        ggml_tensor * v_rot = nullptr;
     };
+
+    void init_rotation(const char * name_tag);
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -324,6 +334,7 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> attn_rot_bufs;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
@@ -485,6 +496,10 @@ public:
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+
+    // the rotation resident on the layer's device, or fallback (the host input) if it has none
+    ggml_tensor * get_k_rot(int32_t il, ggml_tensor * fallback) const;
+    ggml_tensor * get_v_rot(int32_t il, ggml_tensor * fallback) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;

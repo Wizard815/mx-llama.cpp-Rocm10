@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 
 struct ggml_tensor;
@@ -30,6 +31,9 @@ public:
 
     // drop tensor data that has been read but not yet applied (e.g. when a restore fails)
     virtual void discard() {}
+
+    // run fn once every read_tensor so far has reached its tensor: a reader that defers its writes runs it after them
+    virtual void after_apply(const std::function<void()> & fn) { fn(); }
 
     // bytes read so far
     virtual size_t n_bytes() = 0;

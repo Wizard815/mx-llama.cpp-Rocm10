@@ -414,9 +414,11 @@ static void dsv4_state_read_k_cache(
         dsv4_state_read_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows_ref, s0, ns);
     }
 
-    for (uint32_t s = s0; s < s0 + ns; ++s) {
-        kv->sync_replicas(s, 0, n_rows_ref);
-    }
+    io.after_apply([kv, s0, ns, n_rows_ref]() {
+        for (uint32_t s = s0; s < s0 + ns; ++s) {
+            kv->sync_replicas(s, 0, n_rows_ref);
+        }
+    });
 }
 
 static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {

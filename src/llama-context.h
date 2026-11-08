@@ -445,6 +445,10 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // whether the reserve graph has a logits tensor, set in sched_reserve()
+    // true until then, because the first output_reserve() runs before any graph is reserved
+    bool graph_has_logits = true;
     bool prev_decode_small  = false; // last decode was a small (< 32 token) batch, see decode()
 
     // state of sched_copy_experts, reset before each graph compute

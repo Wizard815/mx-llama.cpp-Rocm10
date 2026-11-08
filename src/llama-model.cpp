@@ -512,11 +512,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "") -> tensor_config {
         // the layers in a tensor can be inhomogeneous, if the pattern is cleanly divided by the number of GPUs there can be aliasing effects,
         //     count only the same type of previous layers to avoid this
-        auto get_il_eff = [&](size_t il){
-            // a layer without its own KV reads the KV of the last earlier layer of its type, so it needs that layer's rotation
-            if (hparams.n_layer_kv_from_start >= 2 && il >= (size_t) hparams.n_layer_kv_from_start) {
-                il = hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
-            }
+        auto get_il_eff = [&](const size_t il){
             size_t ret = 0;
             const bool il_is_recr = hparams.is_recr(il);
             const bool il_is_swa  = hparams.is_swa(il);
@@ -544,6 +540,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         } else {
             il = 0;
             rotation = hparams.n_layer() % ud->n_devices;
+        }
+        // A Gemma 4 drafter's split SWA layers share the KV of the target's last SWA layer, which is the second to last
+        // layer. Each Q head must be on the same device as its KV head, so both sides use a fixed rotation.
+        if (ud->model->arch == LLM_ARCH_GEMMA4_ASSISTANT ||
+                (ud->model->arch == LLM_ARCH_GEMMA4 && il + 2 == hparams.n_layer_all && hparams.n_head_kv(il) > 1)) {
+            rotation = 0;
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
         if (tensor_axis_0 == nullptr) {
@@ -676,7 +678,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 }
             }
             if (il_blk >= (long) ud->model->hparams.n_layer()) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                // A Gemma 4 drafter reads the target's KV. Where that KV is split by head, a mirrored Q has no KV
+                // to attend to, so these weights split like the target's. The rest of the block stays mirrored.
+                const bool splits_with_target_kv = ud->model->arch == LLM_ARCH_GEMMA4_ASSISTANT &&
+                        hparams.n_head_kv(il_blk) > 1 &&
+                        (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_attn_out_weight));
+                if (!splits_with_target_kv) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                }
             }
         }
 
@@ -798,6 +807,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // the PLE table is model-level and its conv is mirrored, so every device runs the whole conv and needs the whole history
         if (std::regex_match(tensor_name, pattern_ple_r_cache)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
+        // Some Gemma 4 layers share one KV head between all their Q heads. That head cannot be split, so it is mirrored and the Q heads are split.
+        // Layers with several KV heads keep the standard split: each Q head has to stay on the same device as its KV head.
+        if (ud->model->arch == LLM_ARCH_GEMMA4 && (std::regex_match(tensor_name, pattern_kv_weight) ||
+                std::regex_match(tensor_name, pattern_kv_bias) || std::regex_match(tensor_name, pattern_kv_cache))) {
+            const tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            if (hparams.n_head_kv(tc.il) == 1) {
+                return tc;
+            }
         }
 
         // standard attention
@@ -1029,7 +1048,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         } else {
             // regular attention
-            const uint32_t n_gqa    = hparams.n_gqa(il);
+            // a mirrored KV head does not tie the Q heads together (see the Gemma 4 rule in get_tensor_config)
+            const uint32_t n_gqa    = ud->model->arch == LLM_ARCH_GEMMA4 && hparams.n_head_kv(il) == 1 ? 1 : hparams.n_gqa(il);
             const uint32_t n_embd_q = n_gqa * hparams.n_embd_head_k(il);
 
             // to handle head sizes like 80, only increase granularity while it doesn't cause underutilization
@@ -3527,6 +3547,9 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
+
+    // add the LM head (if the context outputs logits)
+    llm->build_logits();
 
     // add backend sampling layers (if any)
     llm->build_sampling();
