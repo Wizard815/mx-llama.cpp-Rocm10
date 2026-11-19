@@ -465,6 +465,28 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
+// Rows per block and warps for the GCN register-cached Q4_0/Q4_1 path: 2..4 columns (the MTP verify pass) and 5..8.
+#ifndef GCN_MMVQ_Q4_RPB
+#define GCN_MMVQ_Q4_RPB 4
+#endif
+#ifndef GCN_MMVQ_Q4_NW
+#define GCN_MMVQ_Q4_NW 1
+#endif
+#ifndef GCN_MMVQ_Q4_RPB8
+#define GCN_MMVQ_Q4_RPB8 4
+#endif
+#ifndef GCN_MMVQ_Q4_NW8
+#define GCN_MMVQ_Q4_NW8 1
+#endif
+// 5..8 columns read their weights faster with half a block per thread, whatever VDR the type uses elsewhere.
+#ifndef GCN_MMVQ_Q4_VDR8
+#define GCN_MMVQ_Q4_VDR8 2
+#endif
+
+static constexpr __host__ __device__ bool mmvq_gcn_q4_multicol(ggml_type type, int ncols_dst, int table_id) {
+    return table_id == MMVQ_PARAMETERS_GCN && (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1) && ncols_dst >= 2 && ncols_dst <= 8;
+}
+
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
@@ -482,6 +504,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 return 1;
         }
     } else if (table_id == MMVQ_PARAMETERS_GCN) {
+        if (mmvq_gcn_q4_multicol(type, ncols_dst, table_id)) {
+            return ncols_dst <= 4 ? GCN_MMVQ_Q4_NW : GCN_MMVQ_Q4_NW8;
+        }
         switch (ncols_dst) {
             case 1:
                 return 2;
@@ -615,6 +640,9 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (mmvq_gcn_q4_multicol(type, ncols_dst, table_id)) {
+        return ncols_dst <= 4 ? GCN_MMVQ_Q4_RPB : GCN_MMVQ_Q4_RPB8;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
@@ -659,8 +687,8 @@ static __global__ void mul_mat_vec_q(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+    constexpr int vdr = mmvq_gcn_q4_multicol(type, ncols_dst, table_id) && ncols_dst > 4 ? GCN_MMVQ_Q4_VDR8 : get_vdr_mmvq(type);
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -791,6 +819,85 @@ static __global__ void mul_mat_vec_q(
             }
         }
 #endif
+
+#if defined(GGML_USE_HIP) && defined(GCN)
+        // Each column's activations are otherwise re-read through L1 for every row; on Vega that read is the
+        // bottleneck of the 4-column MTP verify pass (after JeanP00l/mi50-qwen3.8-fast, ported to Q4_1 and the gate).
+        if constexpr (mmvq_gcn_q4_multicol(type, ncols_dst, table_id)) {
+            constexpr bool is_q4_0 = type == GGML_TYPE_Q4_0;
+            int   v[rows_per_cuda_block][vdr];
+            int   vg[has_fusion ? rows_per_cuda_block : 1][vdr];
+            half2 dmx[rows_per_cuda_block];
+            half2 dmg[has_fusion ? rows_per_cuda_block : 1];
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const int ib = kbx_offset + i*stride_row_x + kbx;
+                if constexpr (is_q4_0) {
+                    const block_q4_0 * bx = (const block_q4_0 *) vx + ib;
+#pragma unroll
+                    for (int l = 0; l < vdr; ++l) {
+                        v[i][l] = get_int_b2(bx->qs, kqs + l);
+                    }
+                    dmx[i] = make_half2(bx->d, bx->d);
+                } else {
+                    const block_q4_1 * bx = (const block_q4_1 *) vx + ib;
+#pragma unroll
+                    for (int l = 0; l < vdr; ++l) {
+                        v[i][l] = get_int_b4(bx->qs, kqs + l);
+                    }
+                    dmx[i] = bx->dm;
+                }
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        if constexpr (is_q4_0) {
+                            const block_q4_0 * bg = (const block_q4_0 *) vgate + ib;
+#pragma unroll
+                            for (int l = 0; l < vdr; ++l) {
+                                vg[i][l] = get_int_b2(bg->qs, kqs + l);
+                            }
+                            dmg[i] = make_half2(bg->d, bg->d);
+                        } else {
+                            const block_q4_1 * bg = (const block_q4_1 *) vgate + ib;
+#pragma unroll
+                            for (int l = 0; l < vdr; ++l) {
+                                vg[i][l] = get_int_b4(bg->qs, kqs + l);
+                            }
+                            dmg[i] = bg->dm;
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const block_q8_1 * by = &y[j*stride_col_y + kby];
+                int u[2*vdr];
+#pragma unroll
+                for (int l = 0; l < vdr; ++l) {
+                    u[2*l+0] = get_int_b4(by->qs, kqs + l);
+                    u[2*l+1] = get_int_b4(by->qs, kqs + l + qi);
+                }
+                const half2 ds = by->ds;
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    if constexpr (is_q4_0) {
+                        tmp[j][i] += vec_dot_q4_0_q8_1_impl<vdr>(v[i], u, __low2float(dmx[i]), ds);
+                    } else {
+                        tmp[j][i] += vec_dot_q4_1_q8_1_impl<vdr>(v[i], u, dmx[i], ds);
+                    }
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            if constexpr (is_q4_0) {
+                                tmp_gate[j][i] += vec_dot_q4_0_q8_1_impl<vdr>(vg[i], u, __low2float(dmg[i]), ds);
+                            } else {
+                                tmp_gate[j][i] += vec_dot_q4_1_q8_1_impl<vdr>(vg[i], u, dmg[i], ds);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+#endif // defined(GGML_USE_HIP) && defined(GCN)
 
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
