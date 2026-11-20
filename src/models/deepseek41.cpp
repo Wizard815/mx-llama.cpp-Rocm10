@@ -156,6 +156,8 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 
         layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, 0);
+        // image-span tokens route with their own bias (training noaux_tc_for_vl), only present in files made for mtmd
+        layer.ffn_exp_probs_b_vl = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
         layer.ffn_norm        = create_tensor(tn(LLM_TENSOR_FFN_NORM,        "weight", i), {n_embd}, 0);
 
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
@@ -250,9 +252,12 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     std::vector<int32_t> idx(n_cols*n_tokens*n_eng);
     std::vector<int64_t> tok(n_gram);
 
+    // the graph builds no engram for an embd ubatch, as the reference gives image spans no engram contribution
+    // image cells keep a null token, so the look-back of the text after an image stops there, like the DEAD marker of the reference
+    GGML_ASSERT(ubatch->token != nullptr);
+
     for (int64_t i = 0; i < n_tokens; ++i) {
-        // an embd ubatch carries no ids; the reference gives image spans no engram contribution at all, and until that mask exists here, hashing them as padding is the closest stand-in
-        tok[0] = ubatch->token ? compress(ubatch->token[i]) : pad;
+        tok[0] = compress(ubatch->token[i]);
 
         // look-back stops at the start of the sequence, and everything at or before the cut pads
         bool cut = false;
@@ -342,7 +347,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_inp_engram(const llama_model &
         inp->n_threads = n_threads;
         for (int64_t e = 0; e < n_eng; ++e) {
             const ggml_tensor * table = model.layers[hparams.engram_layer_ids[e]].engram_embed;
-            if (!table || (!hparams.no_alloc && !table->data) || !table->buffer || !ggml_backend_buffer_is_host(table->buffer) ||
+            if (!table || (!model.no_alloc() && !table->data) || !table->buffer || !ggml_backend_buffer_is_host(table->buffer) ||
                     table->type != GGML_TYPE_MXFP4 || table->ne[0] != hparams.engram_head_dim || !ggml_is_contiguous(table)) {
                 throw std::runtime_error("Experimental host Engram inputs require canonical host MXFP4 tables");
             }
@@ -421,10 +426,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_engram(
     return ggml_add(ctx0, x, out);
 }
 
-llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_params & params)
-    : llama_model_deepseek4::graph(model, params) {
+llama_model_deepseek41::graph::graph(const llm_graph_params & params)
+    : llama_model_deepseek4::graph(params) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_deepseek41::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<llama_model_deepseek41::graph>(*this, params);
+    return std::make_unique<llama_model_deepseek41::graph>(params);
 }

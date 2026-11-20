@@ -17,15 +17,43 @@
 // llama_memory_recurrent
 //
 
+// the ring needs every snapshot slot written by the delta-net kernels, verified on CPU and CUDA/HIP only
+static bool ring_backend_ok(ggml_backend_dev_t dev) {
+    if (!dev) {
+        return true;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const char * name = reg ? ggml_backend_reg_name(reg) : "";
+    return strcmp(name, "CPU") == 0 || strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0 || strcmp(name, "Meta") == 0;
+}
+
+static bool ring_backends_ok(const llama_model & model, bool offload) {
+    if (!offload) {
+        return true;
+    }
+    for (const auto & d : model.devices) {
+        if (!d.is_meta && !ring_backend_ok(d.dev)) {
+            return false;
+        }
+    }
+    for (int il = 0; il < (int) model.hparams.n_layer(); il++) {
+        if (!ring_backend_ok(model.dev_layer(il))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
+                 bool   no_alloc,
                 ggml_type   type_r,
                 ggml_type   type_s,
                      bool   offload,
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-    const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
+    const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max), ctxs_bufs(no_alloc) {
     const int32_t n_layer = hparams.n_layer();
 
     head = 0;
@@ -43,6 +71,10 @@ llama_memory_recurrent::llama_memory_recurrent(
             // Preserving all of its historical ring planes across that move needs a multi-sequence copy planner.
             // until that exists, keep the proven plane-indexed path for parallel contexts instead of advertising history which remains in the source cell.
             ring_enabled = n_rs_seq > 0 && n_seq_max == 1;
+            if (ring_enabled && !ring_backends_ok(model, offload)) {
+                LLAMA_LOG_INFO("%s: snapshot ring disabled, the model runs on a backend where it is not verified\n", __func__);
+                ring_enabled = false;
+            }
             break;
         default:
             ring_enabled = false;
@@ -135,15 +167,11 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
     }
 
-    // allocate tensors and initialize the buffers to avoid NaNs in the padding
+    // allocate the tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
-        if (!buf) {
-            throw std::runtime_error("failed to allocate buffer for rs cache");
-        }
-        ggml_backend_buffer_clear(buf, 0);
+        ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(ctx), buft, "rs cache");
+
         LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
-        ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
     if (is_empty()) {
@@ -178,6 +206,7 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].seq_id.clear();
         cells[i].src = -1;
         cells[i].tail = -1;
+        cells[i].rs_max = 0;
     }
 
     head = 0;
@@ -222,7 +251,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
 
-            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            // partial rollback via per-token snapshot index (bounded by the snapshots of the last ubatch)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 // a cell shared by several sequences cannot move back for only one of them
                 if (cell.seq_id.size() > 1) {
@@ -256,7 +285,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
                     const llama_pos max_rollback = ring_enabled
                         ? std::min<llama_pos>((llama_pos) n_rs_seq, (llama_pos) valid_depth[seq_id] - 1)
-                        : (llama_pos) n_rs_seq;
+                        : (llama_pos) cell.rs_max;
                     if (!pending && rollback >= 1 && rollback <= max_rollback) {
                         set_rs_idx(seq_id, (uint32_t) rollback);
                         rs_target[seq_id] = target;
@@ -576,6 +605,9 @@ void llama_memory_recurrent_context::plan_snapshot_writes(
         int32_t * dst, uint32_t n_seqs, uint32_t n_snap) const {
     GGML_ASSERT(mem->ring_enabled);
     GGML_ASSERT(dst != nullptr);
+    // a second plan for the same ubatch would advance the rings twice
+    GGML_ASSERT(i_planned != (int64_t) i_next);
+    i_planned = (int64_t) i_next;
     GGML_ASSERT(n_snap > 0 && n_snap <= mem->n_planes());
     GGML_ASSERT(mem->head + n_seqs <= mem->cells.size());
 
@@ -595,11 +627,7 @@ void llama_memory_recurrent_context::plan_snapshot_writes(
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
-    std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [_, buf] : ctxs_bufs) {
-        ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
-    }
-    return ret;
+    return ctxs_bufs.memory_breakdown();
 }
 
 llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -847,13 +875,14 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        if (ubatch.n_pos == 1 && cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
                 __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
         cell.pos = last_pos;
+        cell.rs_max = n_seq_tokens <= n_rs_seq + 1 ? n_seq_tokens - 1 : 0;
         cell.seq_id.clear();
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];

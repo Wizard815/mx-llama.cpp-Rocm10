@@ -782,6 +782,32 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     return it->second[index];
 }
 
+// bytes spanned by all dims except skip_dim
+static size_t ggml_backend_meta_inner_extent(const struct ggml_tensor * tensor, int skip_dim) {
+    size_t extent = 0;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (i != skip_dim && tensor->ne[i] > 1) {
+            extent += (size_t) (tensor->ne[i] - 1) * tensor->nb[i];
+        }
+    }
+    return extent;
+}
+
+// the view dim that holds the split axis of src, or -1
+// all other dims of src and view must stay inside one slab of that axis
+static int ggml_backend_meta_view_slab_dim(const struct ggml_tensor * view, const struct ggml_tensor * src, int axis) {
+    const size_t slab = src->nb[axis];
+    if (ggml_backend_meta_inner_extent(src, axis) >= slab) {
+        return -1;
+    }
+    for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+        if (view->ne[dim] == src->ne[axis] && view->nb[dim] == slab) {
+            return ggml_backend_meta_inner_extent(view, dim) < slab ? dim : -1;
+        }
+    }
+    return -1;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
 // A statically allocated MIRRORED tensor may name the lanes that hold a copy in nr[1], a bit per lane, with 0 meaning every lane.
@@ -1113,8 +1139,38 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             GGML_ABORT("fatal error");
         }
+        // permuted view: split the view dim that spans the src split axis, other dims must be inside one element of it or outside the span
+        if (ggml_is_permuted(tensor) && !ggml_is_permuted(tensor->src[0]) && axis >= 0 && axis < GGML_MAX_DIMS-1) {
+            const size_t nb_axis = tensor->src[0]->nb[axis];
+            const size_t nb_next = tensor->src[0]->nb[axis+1];
+            for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                if (tensor->ne[dim] == 1 || tensor->nb[dim] < nb_axis || tensor->nb[dim]*tensor->ne[dim] != nb_next) {
+                    continue;
+                }
+                bool others_ok = true;
+                for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                    if (i == dim || tensor->ne[i] == 1) {
+                        continue;
+                    }
+                    others_ok = others_ok && (tensor->nb[i]*tensor->ne[i] <= tensor->nb[dim] || tensor->nb[i] % nb_next == 0);
+                }
+                if (others_ok) {
+                    return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
+                }
+            }
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
             return src_ss[0];
+        }
+        // a view that only regroups dims inside one slab of the split axis keeps the split,
+        // the per-device strides are only rescaled above nb[axis] (e.g. the KV streams of a permuted q)
+        if (axis >= 0 && axis < GGML_MAX_DIMS && tensor->view_offs == tensor->src[0]->view_offs) {
+            const int dim = ggml_backend_meta_view_slab_dim(tensor, tensor->src[0], axis);
+            if (dim >= 0) {
+                ggml_backend_meta_split_state ret = src_ss[0];
+                ret.axis = ggml_backend_meta_split_axis(dim);
+                return ret;
+            }
         }
         GGML_ABORT("view of permuted tensor not implemented");
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
@@ -1309,7 +1365,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_ADD_ID: {
                 split_state = handle_bin_bcast(src_ss);
             } break;
-            case GGML_OP_ADD1:
             case GGML_OP_ACC: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -1402,9 +1457,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_SET_ROWS: {
                 split_state = handle_set_rows(src_ss);
             } break;
-            case GGML_OP_DIAG:
-            case GGML_OP_DIAG_MASK_INF:
-            case GGML_OP_DIAG_MASK_ZERO: {
+            case GGML_OP_DIAG: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_SOFT_MAX:
@@ -1442,8 +1495,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_pad(src_ss);
             } break;
             case GGML_OP_PAD_REFLECT_1D:
-            case GGML_OP_ROLL:
-            case GGML_OP_ARANGE:
+            case GGML_OP_ROLL: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            case GGML_OP_ARANGE: {
+                // no sources, every device computes the full range
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            } break;
             case GGML_OP_TIMESTEP_EMBEDDING: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -1488,7 +1546,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
-            case GGML_OP_DSV4_HC_POST: {
+            case GGML_OP_DSV4_HC_POST:
+            case GGML_OP_TOP_K_MASK: {
                 // DeepSeek-V4 custom attention ops. Replicated under design A (mirrored in, mirrored out).
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -2278,6 +2337,9 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .cpy_tensor      = */ nullptr,
     /* .clear           = */ ggml_backend_meta_buffer_clear,
     /* .reset           = */ ggml_backend_meta_buffer_reset,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
 };
 
 bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
@@ -2331,13 +2393,14 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
     constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
+    constexpr size_t compute_headroom_min = 256; // A buffer with few tensors can still get many views, e.g. a KV cache shared by many layers.
     const ggml_init_params params_static = {
         /*.mem_size   =*/ n_tensors * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
     const ggml_init_params params_compute = {
-        /*.mem_size   =*/ compute_headroom * n_tensors * ggml_tensor_overhead(),
+        /*.mem_size   =*/ std::max(compute_headroom * n_tensors, compute_headroom_min) * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -4225,7 +4288,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 if (other != nullptr &&
                                         ggml_backend_meta_get_split_state(other, false).axis ==
                                         GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-                                    i_delayed = k;
+                                    // The zero-slice rule below clears the compute flag on every node up to i_delayed on a lane where node i holds a zero slice.
+                                    // Folding across the other operand's producer chain would clear that lane's share of the other branch as well.
+                                    // So fold only when both operands are computed on the same lanes, as get_i_delayed does for its own fold.
+                                    bool same_lanes = true;
+                                    for (size_t j = 0; j < n_backends && same_lanes; j++) {
+                                        const bool c_node  = backend_ctx->backend_configs[j].nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE;
+                                        const bool c_other = ggml_backend_meta_buffer_simple_tensor(other, j)->flags & GGML_TENSOR_FLAG_COMPUTE;
+                                        same_lanes = c_node == c_other;
+                                    }
+                                    if (same_lanes) {
+                                        i_delayed = k;
+                                    }
                                 }
                             }
                             break;
@@ -4439,11 +4513,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             backend_ctx->ctx.reset(ggml_init(params));
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
-                // Recreate up to max_subgraphs at max_nnodes capacity, not this graph's
-                // counts: the ctx reset above destroyed every previously created graph,
-                // and a later graph may reuse any index up to the maxima without passing
-                // through this branch again. Fragments hit this (their node and subgraph
-                // counts vary independently), whole graphs raise both maxima together.
                 for (size_t i = 0; i < backend_ctx->max_subgraphs; i++) {
                     bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(backend_ctx->ctx.get(), backend_ctx->max_nnodes, /*grads =*/ false);
                 }

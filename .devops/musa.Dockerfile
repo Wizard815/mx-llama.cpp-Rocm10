@@ -15,12 +15,15 @@ FROM docker.io/node:$NODE_VERSION AS web
 
 ARG APP_VERSION
 
-WORKDIR /app/tools/ui
+WORKDIR /app/ui/apps/chat
 
-COPY tools/ui/package.json tools/ui/package-lock.json ./
+COPY ui/apps/chat/package.json ui/apps/chat/package-lock.json ./
 RUN npm ci
 
-COPY tools/ui/ ./
+COPY ui/apps/chat/ ./
+# the app compiles Llama UI from its source next to it
+COPY ui/lib/ui/package.json /app/ui/lib/ui/package.json
+COPY ui/lib/ui/src/lib/ /app/ui/lib/ui/src/lib/
 RUN LLAMA_BUILD_NUMBER="$APP_VERSION" npm run build
 
 FROM ${BASE_MUSA_DEV_CONTAINER} AS build
@@ -45,7 +48,7 @@ WORKDIR /app
 
 COPY . .
 
-COPY --from=web /app/tools/ui/dist tools/ui/dist
+COPY --from=web /app/ui/apps/chat/dist ui/apps/chat/dist
 
 RUN if [ "${MUSA_DOCKER_ARCH}" != "default" ]; then \
         export CMAKE_ARGS="-DMUSA_ARCHITECTURES=${MUSA_DOCKER_ARCH}"; \
@@ -120,7 +123,7 @@ ENTRYPOINT ["/app/tools.sh"]
 ### Light, CLI only
 FROM base AS light
 
-COPY --from=build /app/full/llama /app/full/llama-cli /app/full/llama-completion /app
+COPY --from=build /app/full/llama /app/full/llama-cli /app/full/llama-completion /app/
 
 WORKDIR /app
 
@@ -132,7 +135,7 @@ FROM base AS server
 ENV LLAMA_ARG_HOST=0.0.0.0
 ENV LLAMA_ARG_PORT=8080
 
-COPY --from=build /app/full/llama /app/full/llama-server /app
+COPY --from=build /app/full/llama /app/full/llama-server /app/
 
 WORKDIR /app
 

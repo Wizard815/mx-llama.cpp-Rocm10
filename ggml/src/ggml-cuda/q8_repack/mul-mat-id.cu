@@ -7,6 +7,7 @@
 #include "../quantize.cuh"
 #include "../mmq.cuh"
 #include "../mmid.cuh"
+#include "mmid-bounds.cuh"
 
 #include <atomic>
 #include <cstdio>
@@ -122,7 +123,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     if (n_tokens > 1) {
         const int si1  = ids->nb[1] / sizeof(int32_t);
         const int sis1 = src1->nb[2] / src1->nb[1];
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data,
+        ggml_cuda_launch_mm_ids_bounds_helper((const int32_t *) ids->data,
             ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, n_tokens, n_expert_used, src1->ne[1], si1, sis1, false, stream);
         CUDA_CHECK(cudaGetLastError());
@@ -618,7 +619,7 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
         ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
         const int si1  = ids->nb[1] / sizeof(int32_t);
         const int sis1 = src1->nb[2] / src1->nb[1];
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data,
+        ggml_cuda_launch_mm_ids_bounds_helper((const int32_t *) ids->data,
             ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, n_tokens, n_expert_used, src1->ne[1], si1, sis1, false, stream);
         CUDA_CHECK(cudaGetLastError());

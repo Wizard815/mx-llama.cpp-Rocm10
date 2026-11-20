@@ -11,6 +11,12 @@ void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.n_layer_kv_from_start = hparams.n_layer_all - (int32_t)n_kv_shared_layers;
     hparams.f_attention_scale     = 1.0f; // Gemma4 uses self.scaling = 1.0 (no pre-attn scaling)
 
+    // shared layers read the KV of the last layer with own KV and the same SWA type
+    GGML_ASSERT(hparams.n_layer_kv_from_start >= 2);
+    for (uint32_t il = hparams.n_layer_kv_from_start; il < hparams.n_layer_all; il++) {
+        hparams.kv_source_impl[il] = hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
+    }
+
     ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,          hparams.rope_freq_base_train_swa, false);
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
@@ -47,13 +53,13 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
         throw std::runtime_error("Gemma 4 requires n_embd_head_k_swa == n_embd_head_v_swa");
     }
 
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
     }
-
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
     if (n_embd_per_layer > 0) {
         per_layer_tok_embd   = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),    {n_embd_per_layer * n_layer, n_vocab}, TENSOR_READ_LAZY);
@@ -142,7 +148,7 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_gemma4::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
 // get 2D slice view from a 3D tensor, the idx corresponds to the 3rd dim
@@ -151,9 +157,8 @@ static ggml_tensor * gemma4_view_2d_slice(ggml_context * ctx0, ggml_tensor * x, 
     return ggml_view_2d(ctx0, x, x->ne[0], x->ne[1], x->nb[1], idx * x->nb[2]);
 }
 
-llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_params & params) :
+llama_model_gemma4::graph::graph(const llm_graph_params & params) :
         llm_graph_context(params),
-        model(model),
         n_embd_per_layer(model.hparams.n_embd_per_layer) {
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -207,9 +212,15 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             inpL    = ggml_get_rows(ctx0, inpL, inp_out_ids);
             inp_pos = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, inp_pos, 1, n_tokens), inp_out_ids), n_outputs);
 
-            // TODO: instead of doing get_rows here, have the mask input build just the pruned output cells
-            inp_attn_prune.self_kq_mask_cnv     = ggml_cast(ctx0, ggml_get_rows(ctx0, inp_attn_full.self_kq_mask_cnv,     inp_out_ids), inp_attn_full.self_kq_mask_cnv->type);
-            inp_attn_prune.self_kq_mask_swa_cnv = ggml_cast(ctx0, ggml_get_rows(ctx0, inp_attn_full.self_kq_mask_swa_cnv, inp_out_ids), inp_attn_full.self_kq_mask_swa_cnv->type);
+            // TODO: instead of doing get_rows here, extend llm_attn_mask to have a `out` mask that
+            //       is construted during set_input to contain just the pruned output cells
+            //       this can be used to enable pruning with more than 1 sequence, both with unified and split KV cache
+            //       ref: https://github.com/ggml-org/llama.cpp/pull/31356#discussion_r4455286628
+            inp_attn_prune.self_attn_mask.raw     = ggml_get_rows(ctx0, inp_attn_full.self_attn_mask.raw,     inp_out_ids);
+            inp_attn_prune.self_attn_mask_swa.raw = ggml_get_rows(ctx0, inp_attn_full.self_attn_mask_swa.raw, inp_out_ids);
+
+            inp_attn_prune.self_attn_mask.raw     = ggml_cast(ctx0, inp_attn_prune.self_attn_mask.raw,     GGML_TYPE_F16);
+            inp_attn_prune.self_attn_mask_swa.raw = ggml_cast(ctx0, inp_attn_prune.self_attn_mask_swa.raw, GGML_TYPE_F16);
 
             n_rows = n_outputs;
 
@@ -222,21 +233,11 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         const int64_t n_head    = hparams.n_head(il);
         const int64_t n_head_kv = hparams.n_head_kv(il);
 
-        const float freq_base_l  = model.get_rope_freq_base(cparams, il);
-        const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
-        const int   n_rot_l      = hparams.n_rot(il);
-
         res->t_layer_inp[il] = inpL;
 
         // norm
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
-
-        ggml_tensor * freq_factors = nullptr;
-        if (!hparams.is_swa(il)) {
-            // full_attention layers use rope_freqs for proportional rope
-            freq_factors = model.layers[il].rope_freqs;
-        }
 
         // Q projection (shared for both non-KV and KV layers)
         // this is to mirror Gemma4Attention in pytorch code
@@ -258,8 +259,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
             cb(Qcur, "Qcur_normed", il);
 
-            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-                                 ext_factor, attn_factor, beta_fast, beta_slow);
+            Qcur = build_rope(Qcur, inp_pos, il);
             cb(Qcur, "Qcur_pos", il);
         }
 
@@ -292,8 +292,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cb(Kcur, "Kcur_normed", il);
             cb(Vcur, "Vcur_normed", il);
 
-            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
-                                 ext_factor, attn_factor, beta_fast, beta_slow);
+            Kcur = build_rope(Kcur, inp_pos, il);
 
             cb(Kcur, "Kcur_pos", il);
 
@@ -557,5 +556,5 @@ ggml_tensor * llama_model_gemma4::graph::project_per_layer_inputs(ggml_tensor * 
     cb(inp_per_layer, "inp_per_layer", -1);
 
     // permute to shape: [n_embd_per_layer, n_tokens, n_layer]
-    return ggml_cont(ctx0, ggml_permute(ctx0, inp_per_layer, 0, 2, 1, 3));
+    return ggml_permute(ctx0, inp_per_layer, 0, 2, 1, 3);
 }
