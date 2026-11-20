@@ -1665,16 +1665,17 @@ static int mmvq_gcn_mc_env(const char * name, const int def) {
     return s ? atoi(s) : def;
 }
 
-// A/B switches, 0 = old path: GGML_MMVQ_GCN_MC, _K (Q5_K/Q6_K), _Q8 (Q8_0), _Q2K, _Q3K, _IQ2S, _IQ3XXS, _IQ3S,
-// _IQ4NL, _IQ4XS, _Q6K1 (1-column Q6_K), _FUSED; _1COL=1 adds the other 1-column calls of Q4_0/Q4_1/Q5_K; _GROUPS
-// (2|4), _WARPS (1|2|4), _WPE (2|3) override the shapes chosen below.
+// A/B switches, 0 = old path: GGML_MMVQ_GCN_MC, _K (Q4_K/Q5_K/Q6_K), _Q4K (Q4_K), _Q8 (Q8_0), _Q2K, _Q3K, _IQ2S,
+// _IQ3XXS, _IQ3S, _IQ4NL, _IQ4XS, _Q6K1 (1-column Q6_K), _FUSED; _1COL=1 adds the other 1-column calls of
+// Q4_0/Q4_1/Q5_K; _GROUPS (2|4), _WARPS (1|2|4), _WPE (2|3) override the shapes chosen below.
 template <ggml_type type>
 static bool mul_mat_vec_q_gcn_mc_try(const int ncols_dst, const mmvq_gcn_mc_args & p, cudaStream_t stream) {
     constexpr const char * type_env = mmvq_gcn_mc_type_env(type);
     static const bool enabled     = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC", 1) != 0 &&
         (type_env ? mmvq_gcn_mc_env(type_env, 1) != 0 :
             mmvq_gcn_mc_q4(type) ||
-            mmvq_gcn_mc_env(type == GGML_TYPE_Q8_0 ? "GGML_MMVQ_GCN_MC_Q8" : "GGML_MMVQ_GCN_MC_K", 1) != 0);
+            mmvq_gcn_mc_env(type == GGML_TYPE_Q8_0 ? "GGML_MMVQ_GCN_MC_Q8" : "GGML_MMVQ_GCN_MC_K", 1) != 0) &&
+        (type != GGML_TYPE_Q4_K || mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_Q4K", 1) != 0);
     static const bool q6_k_1      = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_Q6K1", 1) != 0;
     static const bool one_col     = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_1COL", 0) != 0;
     static const bool fused       = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_FUSED", 1) != 0;
@@ -1894,8 +1895,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
     }
 
 #if defined(GGML_USE_HIP)
-    if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q5_K ||
-            type == GGML_TYPE_Q6_K || mmvq_gcn_mc_type_env(type) != nullptr) {
+    if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K ||
+            type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || mmvq_gcn_mc_type_env(type) != nullptr) {
         if (GGML_CUDA_CC_IS_GCN(cc) && !has_ids) {
             const mmvq_gcn_mc_args p = {
                 vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
