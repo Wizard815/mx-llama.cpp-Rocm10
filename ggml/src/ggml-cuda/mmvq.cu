@@ -314,48 +314,53 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 }
 
 // GCN (MI50, Qwen3.8 27B shapes): the most columns for which the mat-vec beats MMQ's 8-column tile, 0 = not measured.
-static constexpr int get_mmvq_max_batch_gcn(ggml_type type) {
+// With fewer rows MMQ has fewer tiles than the card has blocks and splits K (stream-k), so the mat-vec stays longer.
+static constexpr int get_mmvq_max_batch_gcn(ggml_type type, bool wide) {
     switch (type) {
         case GGML_TYPE_Q8_0:    return 8;
-        case GGML_TYPE_Q3_K:    return 4;
-        case GGML_TYPE_Q4_K:    return 5;
-        case GGML_TYPE_Q5_K:    return 6;
+        case GGML_TYPE_Q3_K:    return wide ? 4 : 5;
+        case GGML_TYPE_Q4_K:    return wide ? 5 : 7;
+        case GGML_TYPE_Q5_K:    return wide ? 5 : 8;
         case GGML_TYPE_Q6_K:    return 8;
         case GGML_TYPE_IQ3_XXS: return 5;
-        case GGML_TYPE_IQ3_S:   return 4;
-        case GGML_TYPE_IQ4_XS:  return 4;
+        case GGML_TYPE_IQ3_S:   return wide ? 4 : 5;
+        case GGML_TYPE_IQ4_XS:  return wide ? 4 : 6;
         default:                return 0;
     }
 }
 
 // GGML_MMVQ_GCN_TABLE=0 keeps the mat-vec up to 8 columns for every type; GGML_MMVQ_GCN_MAX=n and
-// GGML_MMVQ_GCN_MAX_<TYPE>=n (e.g. GGML_MMVQ_GCN_MAX_Q4_K) override the table for the types in it.
-static int get_mmvq_max_batch_gcn_env(const ggml_type type) {
-    static const std::array<int, GGML_TYPE_COUNT> max_batch = [] {
-        const auto env = [](const std::string & name, const int def) {
-            const char * s = getenv(name.c_str());
-            return s ? atoi(s) : def;
-        };
+// GGML_MMVQ_GCN_MAX_<TYPE>=n (e.g. GGML_MMVQ_GCN_MAX_Q4_K) override the table for the types in it, at any row count;
+// GGML_MMVQ_GCN_ROWS sets the row count from which the wide column of the table applies (8192).
+static int get_mmvq_max_batch_gcn_env(const ggml_type type, const int64_t nrows_x) {
+    const auto env = [](const std::string & name, const int def) {
+        const char * s = getenv(name.c_str());
+        return s ? atoi(s) : def;
+    };
+    static const int wide_rows = env("GGML_MMVQ_GCN_ROWS", 8192);
+    static const std::array<std::array<int, 2>, GGML_TYPE_COUNT> max_batch = [&env] {
         const bool table = env("GGML_MMVQ_GCN_TABLE", 1) != 0;
         const int  all   = env("GGML_MMVQ_GCN_MAX", 0);
-        std::array<int, GGML_TYPE_COUNT> r;
+        std::array<std::array<int, 2>, GGML_TYPE_COUNT> r;
         for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
-            int n = MMVQ_MAX_BATCH_SIZE;
-            if (get_mmvq_max_batch_gcn(ggml_type(t)) > 0) {
-                n = table ? get_mmvq_max_batch_gcn(ggml_type(t)) : n;
-                n = all > 0 ? all : n;
-                std::string name = std::string("GGML_MMVQ_GCN_MAX_") + ggml_type_name(ggml_type(t));
-                std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::toupper(c); });
-                n = env(name, n);
+            for (int wide = 0; wide < 2; ++wide) {
+                int n = MMVQ_MAX_BATCH_SIZE;
+                if (get_mmvq_max_batch_gcn(ggml_type(t), wide) > 0) {
+                    n = table ? get_mmvq_max_batch_gcn(ggml_type(t), wide) : n;
+                    n = all > 0 ? all : n;
+                    std::string name = std::string("GGML_MMVQ_GCN_MAX_") + ggml_type_name(ggml_type(t));
+                    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::toupper(c); });
+                    n = env(name, n);
+                }
+                r[t][wide] = std::clamp(n, 1, MMVQ_MAX_BATCH_SIZE);
             }
-            r[t] = std::clamp(n, 1, MMVQ_MAX_BATCH_SIZE);
         }
         return r;
     }();
-    return max_batch[type];
+    return max_batch[type][nrows_x >= wide_rows];
 }
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11, int64_t nrows_x) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
@@ -477,7 +482,7 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         return ne11 <= 6;
     }
     if (GGML_CUDA_CC_IS_GCN(cc)) {
-        return ne11 <= get_mmvq_max_batch_gcn_env(type);
+        return ne11 <= get_mmvq_max_batch_gcn_env(type, nrows_x);
     }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }
