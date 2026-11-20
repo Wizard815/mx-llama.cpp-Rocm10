@@ -3,6 +3,7 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <cctype>
 #include <cstdint>
 #include <type_traits>
 
@@ -312,6 +313,48 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
+// GCN (MI50, Qwen3.8 27B shapes): the most columns for which the mat-vec beats MMQ's 8-column tile, 0 = not measured.
+static constexpr int get_mmvq_max_batch_gcn(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:    return 8;
+        case GGML_TYPE_Q3_K:    return 4;
+        case GGML_TYPE_Q4_K:    return 5;
+        case GGML_TYPE_Q5_K:    return 6;
+        case GGML_TYPE_Q6_K:    return 8;
+        case GGML_TYPE_IQ3_XXS: return 5;
+        case GGML_TYPE_IQ3_S:   return 4;
+        case GGML_TYPE_IQ4_XS:  return 4;
+        default:                return 0;
+    }
+}
+
+// GGML_MMVQ_GCN_TABLE=0 keeps the mat-vec up to 8 columns for every type; GGML_MMVQ_GCN_MAX=n and
+// GGML_MMVQ_GCN_MAX_<TYPE>=n (e.g. GGML_MMVQ_GCN_MAX_Q4_K) override the table for the types in it.
+static int get_mmvq_max_batch_gcn_env(const ggml_type type) {
+    static const std::array<int, GGML_TYPE_COUNT> max_batch = [] {
+        const auto env = [](const std::string & name, const int def) {
+            const char * s = getenv(name.c_str());
+            return s ? atoi(s) : def;
+        };
+        const bool table = env("GGML_MMVQ_GCN_TABLE", 1) != 0;
+        const int  all   = env("GGML_MMVQ_GCN_MAX", 0);
+        std::array<int, GGML_TYPE_COUNT> r;
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            int n = MMVQ_MAX_BATCH_SIZE;
+            if (get_mmvq_max_batch_gcn(ggml_type(t)) > 0) {
+                n = table ? get_mmvq_max_batch_gcn(ggml_type(t)) : n;
+                n = all > 0 ? all : n;
+                std::string name = std::string("GGML_MMVQ_GCN_MAX_") + ggml_type_name(ggml_type(t));
+                std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::toupper(c); });
+                n = env(name, n);
+            }
+            r[t] = std::clamp(n, 1, MMVQ_MAX_BATCH_SIZE);
+        }
+        return r;
+    }();
+    return max_batch[type];
+}
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
@@ -429,16 +472,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
-    // VEGA20 devices are the only devices with dense MMQ -> ggml_cuda_should_use_mmq()
-    if (cc == GGML_CUDA_CC_VEGA20) {
-        switch (type) { // tuned on MI50 (gfx906)
-            case GGML_TYPE_Q4_K:
-                return ne11 <= 7;
-            case GGML_TYPE_NVFP4:
-                return ne11 <= 6;
-            default:
-                return ne11 <= MMVQ_MAX_BATCH_SIZE;
-        }
+    // NVFP4 keeps upstream's MI50 tuning (#32805); the other types follow the per-type GCN table
+    if (cc == GGML_CUDA_CC_VEGA20 && type == GGML_TYPE_NVFP4) {
+        return ne11 <= 6;
+    }
+    if (GGML_CUDA_CC_IS_GCN(cc)) {
+        return ne11 <= get_mmvq_max_batch_gcn_env(type);
     }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }
