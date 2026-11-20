@@ -1477,11 +1477,30 @@ static constexpr int mmvq_gcn_mc_rows(const ggml_type type, const bool gate = fa
     return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 ? (gate ? 2 : 4) : 2;
 }
 
+// The types that reach the row-group kernel with their own vec_dot, each with its own switch.
+static constexpr const char * mmvq_gcn_mc_type_env(const ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_K:    return "GGML_MMVQ_GCN_MC_Q2K";
+        case GGML_TYPE_Q3_K:    return "GGML_MMVQ_GCN_MC_Q3K";
+        case GGML_TYPE_IQ2_S:   return "GGML_MMVQ_GCN_MC_IQ2S";
+        case GGML_TYPE_IQ3_XXS: return "GGML_MMVQ_GCN_MC_IQ3XXS";
+        case GGML_TYPE_IQ3_S:   return "GGML_MMVQ_GCN_MC_IQ3S";
+        case GGML_TYPE_IQ4_NL:  return "GGML_MMVQ_GCN_MC_IQ4NL";
+        case GGML_TYPE_IQ4_XS:  return "GGML_MMVQ_GCN_MC_IQ4XS";
+        default:                return nullptr;
+    }
+}
+
 // Q4 at 2 and 5 columns fits 84 VGPRs (3 waves per SIMD) either way, 6..8 spill there; 3..4 hoist all loads at 2
 // waves. The K-quants stay below 84 VGPRs up to 5 columns anyway. One column: Q6_K fits 40 VGPRs, Q4 48.
+// IQ, Q2_K and Q3_K: up to 128 VGPRs they issue their loads together; where they need more, the compiler waits for
+// each load in turn at 60-90 VGPRs, and those 2-4 waves per SIMD beat 1 wave of 130-220 VGPRs.
 static constexpr int mmvq_gcn_mc_wpe(const ggml_type type, const int ncols_dst) {
     if (ncols_dst == 1) {
         return mmvq_gcn_mc_rows(type) == 4 ? 5 : 6;
+    }
+    if (mmvq_gcn_mc_type_env(type) != nullptr) {
+        return 2;
     }
     return ncols_dst == 2 || ncols_dst == 5 || (mmvq_gcn_mc_rows(type) == 2 && ncols_dst <= 4) ? 3 : 2;
 }
@@ -1561,7 +1580,7 @@ static bool mul_mat_vec_q_gcn_mc_switch_ncols(const int ncols_dst, const int wav
     switch (ncols_dst) {
         case 1:
             // the Q6_K output head of the MTP drafts (248k rows), and the others on request
-            if constexpr (!gate || mmvq_gcn_mc_rows(type) == 4) {
+            if constexpr ((!gate || mmvq_gcn_mc_rows(type) == 4) && mmvq_gcn_mc_type_env(type) == nullptr) {
                 mul_mat_vec_q_gcn_mc_switch_wpe<type, 1, gate>(waves_per_eu, ngroups, nwarps, p, stream);
                 return true;
             }
@@ -1582,12 +1601,15 @@ static int mmvq_gcn_mc_env(const char * name, const int def) {
     return s ? atoi(s) : def;
 }
 
-// A/B switches, 0 = old path: GGML_MMVQ_GCN_MC, _K (Q5_K/Q6_K), _Q6K1 (1-column Q6_K), _FUSED; _1COL=1 adds the
-// other 1-column calls; _GROUPS (2|4), _WARPS (1|2|4), _WPE (2|3) override the shapes chosen below.
+// A/B switches, 0 = old path: GGML_MMVQ_GCN_MC, _K (Q5_K/Q6_K), _Q2K, _Q3K, _IQ2S, _IQ3XXS, _IQ3S, _IQ4NL, _IQ4XS,
+// _Q6K1 (1-column Q6_K), _FUSED; _1COL=1 adds the other 1-column calls of Q4_0/Q4_1/Q5_K; _GROUPS (2|4), _WARPS
+// (1|2|4), _WPE (2|3) override the shapes chosen below.
 template <ggml_type type>
 static bool mul_mat_vec_q_gcn_mc_try(const int ncols_dst, const mmvq_gcn_mc_args & p, cudaStream_t stream) {
+    constexpr const char * type_env = mmvq_gcn_mc_type_env(type);
     static const bool enabled     = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC", 1) != 0 &&
-        (mmvq_gcn_mc_rows(type) == 4 || mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_K", 1) != 0);
+        (type_env ? mmvq_gcn_mc_env(type_env, 1) != 0 :
+            mmvq_gcn_mc_rows(type) == 4 || mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_K", 1) != 0);
     static const bool q6_k_1      = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_Q6K1", 1) != 0;
     static const bool one_col     = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_1COL", 0) != 0;
     static const bool fused       = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_FUSED", 1) != 0;
@@ -1807,7 +1829,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
     }
 
 #if defined(GGML_USE_HIP)
-    if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K) {
+    if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K ||
+            mmvq_gcn_mc_type_env(type) != nullptr) {
         if (GGML_CUDA_CC_IS_GCN(cc) && !has_ids) {
             const mmvq_gcn_mc_args p = {
                 vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
