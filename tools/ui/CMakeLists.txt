@@ -2,6 +2,12 @@ set(TARGET llama-ui)
 
 set(LLAMA_UI_HF_BUCKET "ggml-org/llama-ui" CACHE STRING "Hugging Face bucket name for prebuilt UI assets")
 set(LLAMA_UI_GZIP      ON                  CACHE BOOL   "Apply gzip compress to assets to save bandwidth")
+# This fork's build number never matches an upstream release, so the asset download fell
+# back to "latest". Upstream moved the UI to SvelteKit 3 on 2026-11-17 and "latest" no
+# longer has the files this tree's UI check expects, which broke every fresh build.
+# Pin the assets to the upstream release this fork's UI is based on (mx merge base
+# c4d12e2c0, 2026-10-15). Bump it together with tools/ui when merging upstream.
+set(LLAMA_UI_HF_VERSION "b11680"           CACHE STRING "Prebuilt UI asset release to download (empty = from the build number)")
 
 # Backward compat: forward old var to new one
 if(DEFINED LLAMA_BUILD_WEBUI)
@@ -23,6 +29,8 @@ if(DEFINED ENV{HF_WEBUI_VERSION})
     message(DEPRECATION "HF_WEBUI_VERSION env var is deprecated, use HF_UI_VERSION instead")
 elseif(DEFINED ENV{HF_UI_VERSION})
     set(HF_UI_VERSION "$ENV{HF_UI_VERSION}")
+elseif(NOT "${LLAMA_UI_HF_VERSION}" STREQUAL "")
+    set(HF_UI_VERSION "${LLAMA_UI_HF_VERSION}")
 elseif(DEFINED LLAMA_BUILD_NUMBER)
     set(HF_UI_VERSION "b${LLAMA_BUILD_NUMBER}")
 else()
