@@ -5999,6 +5999,36 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// Quantizing a big matrix on the CPU takes longer than timing it: 64 random rows, repeated
+struct test_mul_mat_big : public test_mul_mat {
+    test_mul_mat_big(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->ne[1] < 4096 || !ggml_is_quantized(t->type)) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            const int64_t nr = 64;
+            std::vector<float> f(t->ne[0]*nr);
+            std::default_random_engine gen(42);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            for (float & x : f) {
+                x = dist(gen);
+            }
+            const size_t row = ggml_row_size(t->type, t->ne[0]);
+            std::vector<uint8_t> q(row*nr);
+            ggml_quantize_chunk(t->type, f.data(), q.data(), 0, nr, t->ne[0], nullptr);
+            std::vector<uint8_t> all(ggml_nbytes(t));
+            for (size_t off = 0; off < all.size(); off += q.size()) {
+                memcpy(all.data() + off, q.data(), std::min(q.size(), all.size() - off));
+            }
+            ggml_backend_tensor_set(t, all.data(), 0, all.size());
+        }
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -12418,6 +12448,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // GCN row-group mat-vec of Q5_K/Q6_K: row tails, an odd superblock count, the Qwen3.8 27B K = 6144
+    for (int n = 2; n <= 8; ++n) {
+        for (ggml_type type_a : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{1021, 4096}, {4099, 4096}, {1021, 17*256}, {5123, 6144}}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
@@ -14421,6 +14460,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 24, 25, 32, 33}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, n, 14336, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 14336, n, 4096, {1, 1}, {1, 1}));
+    }
+
+    // Qwen3.8 27B layer matrices (m x k): attn_k/v, attn_gate, attn_qkv, attn_q, ffn_gate/up, attn_output and ssm_out, ffn_down
+    for (ggml_type type_a : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{1024, 5120}, {6144, 5120}, {10240, 5120}, {12288, 5120},
+                                                                  {17408, 5120}, {5120, 6144}, {5120, 17408}}) {
+            for (int64_t n = 2; n <= 8; ++n) {
+                test_cases.emplace_back(new test_mul_mat_big(type_a, m, n, k));
+            }
+        }
     }
 
     // Q4_K multi-column mat-vec

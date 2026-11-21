@@ -1306,7 +1306,22 @@ static __global__ void mul_mat_vec_q_gcn_mc(
 #endif // defined(GCN)
 }
 
-template <ggml_type type, int ncols_dst, int ngroups, int nwarps, int waves_per_eu>
+using mmvq_gcn_i32x4 = __attribute__((ext_vector_type(4))) int;
+
+// buf[l]: the 16-byte chunk src[l] of the q8_1 tile that starts at superblock kb; a superblock past the end of the row
+// loads the first one of the tile again, nobody reads it
+template <int qk, int nld, int nsb, int cpc>
+static __device__ __forceinline__ void mmvq_gcn_grp_tile_load(mmvq_gcn_i32x4 * buf, const char * y, const uint32_t * src,
+        const int * sbc, const int kb, const int blocks_per_row) {
+    const uint32_t o = kb*uint32_t((qk/QK8_1)*sizeof(block_q8_1));
+#pragma unroll
+    for (int l = 0; l < nld; ++l) {
+        const bool ok = nsb == 1 || kb + sbc[l] < blocks_per_row;
+        buf[l] = *(const mmvq_gcn_i32x4 *) (y + (o + (ok ? src[l] : src[l] - sbc[l]*(cpc/nsb)*16)));
+    }
+}
+
+template <ggml_type type, int ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool lds>
 __launch_bounds__(nwarps*64, waves_per_eu)
 static __global__ void mul_mat_vec_q_gcn_grp(
         const void * __restrict__ vx, const void * __restrict__ vy, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1346,13 +1361,54 @@ static __global__ void mul_mat_vec_q_gcn_grp(
     const int blocks_per_row = ncols_x/qk;
     const int lk  = threadIdx.y*nlanes + lg;
     const int kqs = vdr*(lk % lpb);
-    for (int kbx = lk/lpb; kbx < blocks_per_row; kbx += nwarps*nlanes/lpb) {
-        const int kby = kbx*(qk/QK8_1);
+    if constexpr (lds) {
+        // The row groups of a wave read the same activations: the wave copies them once per K step into LDS.
+        constexpr int nsb    = nlanes/lpb;
+        constexpr int nby    = nsb*(qk/QK8_1);
+        constexpr int cpc    = nby*int(sizeof(block_q8_1))/16;
+        constexpr int nchunk = ncols_dst*cpc;
+        constexpr int nld    = (nchunk + 63)/64;
+        constexpr int kstep  = nwarps*nsb;
+        static_assert(nby*sizeof(block_q8_1) % 16 == 0, "the tile of a column must be whole 16-byte chunks");
+        __shared__ mmvq_gcn_i32x4 tile[nwarps][nld*64];
+        const block_q8_1 * ty = (const block_q8_1 *) tile[threadIdx.y] + (lg/lpb)*(qk/QK8_1);
+
+        uint32_t src[nld];
+        int      sbc[nld];
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+        for (int l = 0; l < nld; ++l) {
+            const int c = min(l*64 + lane, nchunk - 1);
+            src[l] = (c/cpc)*stride_col_y*uint32_t(sizeof(block_q8_1)) + (c % cpc)*16;
+            sbc[l] = (c % cpc)/(cpc/nsb);
+        }
+        for (int kb0 = threadIdx.y*nsb; kb0 < blocks_per_row; kb0 += kstep) {
+            mmvq_gcn_i32x4 buf[nld];
+            mmvq_gcn_grp_tile_load<qk, nld, nsb, cpc>(buf, (const char *) y, src, sbc, kb0, blocks_per_row);
 #pragma unroll
-            for (int i = 0; i < rows; ++i) {
-                a[j*rows + i] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            for (int l = 0; l < nld; ++l) {
+                tile[threadIdx.y][l*64 + lane] = buf[l];
+            }
+            // no barrier: a wave runs its LDS accesses in order, and one would keep the weight loads behind the copy
+            const int kbx = kb0 + lg/lpb;
+            if (nsb == 1 || kbx < blocks_per_row) {
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                    for (int i = 0; i < rows; ++i) {
+                        a[j*rows + i] += vec_dot_q_cuda(vx, ty + j*nby, kbx_offset + i*stride_row_x + kbx, kqs);
+                    }
+                }
+            }
+        }
+    } else {
+        for (int kbx = lk/lpb; kbx < blocks_per_row; kbx += nwarps*nlanes/lpb) {
+            const int kby = kbx*(qk/QK8_1);
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows; ++i) {
+                    a[j*rows + i] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                }
             }
         }
     }
@@ -1577,6 +1633,11 @@ static constexpr int mmvq_gcn_mc_wpe_alt(const ggml_type type, const int ncols_d
     return mmvq_gcn_mc_whole(type) && (ncols_dst == 4 || (ncols_dst == 3 && mmvq_gcn_mc_q4(type))) ? 3 : 0;
 }
 
+static int mmvq_gcn_mc_env(const char * name, const int def) {
+    const char * s = getenv(name);
+    return s ? atoi(s) : def;
+}
+
 struct mmvq_gcn_mc_args {
     const void * vx;
     const void * vy;
@@ -1603,7 +1664,15 @@ static void mul_mat_vec_q_gcn_mc_launch(const mmvq_gcn_mc_args & p, cudaStream_t
             p.stride_sample_x, p.stride_sample_y, p.stride_sample_dst);
     } else {
         static_assert(!gate, "gate fusion is Q4 only");
-        mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu><<<block_nums, block_dims, 0, stream>>>(
+        static const bool lds = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_LDS", 1) != 0;
+        auto kernel = mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, false>;
+        // measured for Q5_K/Q6_K only
+        if constexpr (c_ncols_dst > 1 && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
+            if (lds) {
+                kernel = mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, true>;
+            }
+        }
+        kernel<<<block_nums, block_dims, 0, stream>>>(
             p.vx, p.vy, p.fusion, p.dst, p.ncols_x, p.nrows_x, p.stride_row_x, p.stride_col_y, p.stride_col_dst,
             p.channel_ratio, p.stride_channel_x, p.stride_channel_y, p.stride_channel_dst, p.sample_ratio,
             p.stride_sample_x, p.stride_sample_y, p.stride_sample_dst);
@@ -1663,14 +1732,9 @@ static bool mul_mat_vec_q_gcn_mc_switch_ncols(const int ncols_dst, const int wav
     }
 }
 
-static int mmvq_gcn_mc_env(const char * name, const int def) {
-    const char * s = getenv(name);
-    return s ? atoi(s) : def;
-}
-
 // A/B switches, 0 = old path: GGML_MMVQ_GCN_MC, _K (Q4_K/Q5_K/Q6_K), _Q4K (Q4_K), _Q8 (Q8_0), _Q2K, _Q3K, _IQ2S,
-// _IQ3XXS, _IQ3S, _IQ4NL, _IQ4XS, _Q6K1 (1-column Q6_K), _FUSED; _1COL=1 adds the other 1-column calls of
-// Q4_0/Q4_1/Q5_K; _GROUPS (2|4), _WARPS (1|2|4), _WPE (2|3) override the shapes chosen below.
+// _IQ3XXS, _IQ3S, _IQ4NL, _IQ4XS, _LDS (Q5_K/Q6_K activations through LDS), _Q6K1 (1-column Q6_K), _FUSED; _1COL=1
+// adds the other 1-column calls of Q4_0/Q4_1/Q5_K; _GROUPS (2|4), _WARPS (1|2|4), _WPE (2|3) override the shapes chosen below.
 template <ggml_type type>
 static bool mul_mat_vec_q_gcn_mc_try(const int ncols_dst, const mmvq_gcn_mc_args & p, cudaStream_t stream) {
     constexpr const char * type_env = mmvq_gcn_mc_type_env(type);
