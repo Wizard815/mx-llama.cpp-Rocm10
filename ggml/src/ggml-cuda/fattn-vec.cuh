@@ -48,7 +48,18 @@ static __device__ __forceinline__ void flash_attn_ext_vec_turbo56_V4(
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
 template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+#ifdef GGML_USE_HIP
+// Minimum blocks per CU. llama-of-vega measured 4 as faster (Inkling TG +8% at 4K, +16% at 16K), but with ROCm 6.4
+// clang for gfx906 it caps this fork's kernels at 64 VGPRs and the q8_0/turbo instances spill 200-1100 bytes per lane
+// (2: 128 VGPRs, still up to 700 bytes on turbo D=512). So the default stays 1; A/B with
+// -DGGML_HIP_FA_VEC_MIN_BLOCKS=2 or 4 in the HIP flags (GFX906_HIP_FLAGS for the Docker build).
+#ifndef GGML_HIP_FA_VEC_MIN_BLOCKS
+#define GGML_HIP_FA_VEC_MIN_BLOCKS 1
+#endif
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), GGML_HIP_FA_VEC_MIN_BLOCKS)
+#else
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
+#endif // GGML_USE_HIP
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
         const char * K_ptr,
