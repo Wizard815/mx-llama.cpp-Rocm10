@@ -318,13 +318,13 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 static constexpr int get_mmvq_max_batch_gcn(ggml_type type, bool wide) {
     switch (type) {
         case GGML_TYPE_Q8_0:    return 8;
-        case GGML_TYPE_Q3_K:    return wide ? 4 : 5;
+        case GGML_TYPE_Q3_K:    return 8;
         case GGML_TYPE_Q4_K:    return wide ? 5 : 7;
         case GGML_TYPE_Q5_K:    return wide ? 5 : 8;
         case GGML_TYPE_Q6_K:    return 8;
-        case GGML_TYPE_IQ3_XXS: return 5;
-        case GGML_TYPE_IQ3_S:   return wide ? 4 : 5;
-        case GGML_TYPE_IQ4_XS:  return wide ? 4 : 6;
+        case GGML_TYPE_IQ3_XXS: return 8;
+        case GGML_TYPE_IQ3_S:   return 8;
+        case GGML_TYPE_IQ4_XS:  return 8;
         default:                return 0;
     }
 }
