@@ -1108,8 +1108,10 @@ static constexpr __host__ __device__ bool mmvq_gcn_mc_q4(const ggml_type type) {
     return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1;
 }
 
-static constexpr __host__ __device__ int mmvq_gcn_mc_rows(const ggml_type type, const bool gate = false) {
-    return mmvq_gcn_mc_q4(type) ? (gate ? 2 : 4) : type == GGML_TYPE_Q8_0 ? 4 : 2;
+// Q4_K holds 2 ints per lane and row: 4 rows share each activation read up to 4 columns, past that the compiler
+// no longer keeps all column loads in flight with 4 rows.
+static constexpr __host__ __device__ int mmvq_gcn_mc_rows(const ggml_type type, const int ncols_dst, const bool gate = false) {
+    return mmvq_gcn_mc_q4(type) ? (gate ? 2 : 4) : type == GGML_TYPE_Q8_0 ? 4 : (type == GGML_TYPE_Q4_K && ncols_dst <= 4 ? 4 : 2);
 }
 
 // a[(j*rows + i)*nper + m]: partial sums over this lane's K blocks of column j, row row_r + i, of the matrix (m = 0)
@@ -1209,7 +1211,7 @@ static __global__ void mul_mat_vec_q_gcn_mc(
     constexpr bool is_q8_0  = type == GGML_TYPE_Q8_0;
     static_assert(!(is_q8_0 && gate), "gate fusion is Q4 only");
     constexpr int  nper     = gate ? 2 : 1;
-    constexpr int  rows     = mmvq_gcn_mc_rows(type, gate);
+    constexpr int  rows     = mmvq_gcn_mc_rows(type, ncols_dst, gate);
     constexpr int  qi       = is_q8_0 ? QI8_0 : 4;
     constexpr int  nu       = is_q8_0 ? qi : 2*qi;
     constexpr int  nlanes   = 64/ngroups;
@@ -1318,7 +1320,7 @@ static __global__ void mul_mat_vec_q_gcn_grp(
     constexpr int qk     = ggml_cuda_type_traits<type>::qk;
     constexpr int qi     = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr    = get_vdr_mmvq(type);
-    constexpr int rows   = 2;
+    constexpr int rows   = mmvq_gcn_mc_rows(type, ncols_dst);
     constexpr int nlanes = 64/ngroups;
     constexpr int lpb    = qi/vdr;
     static_assert(nlanes % lpb == 0, "a group must cover whole blocks");
@@ -1556,7 +1558,7 @@ static constexpr const char * mmvq_gcn_mc_type_env(const ggml_type type) {
 
 // Q4 at 2 and 5 columns fits 84 VGPRs (3 waves per SIMD) either way, 6..8 spill there; 3..4 hoist all loads at 2
 // waves. The K-quants stay below 84 VGPRs up to 5 columns anyway. One column: Q6_K fits 40 VGPRs, Q4 48.
-// Q8_0 takes the Q4 shapes but spills at 3 columns and 3 waves.
+// Q8_0 takes the Q4 shapes but spills at 3 columns and 3 waves. Q4_K at 5 loads the columns one after another at 3 waves.
 // IQ, Q2_K and Q3_K: up to 128 VGPRs they issue their loads together; where they need more, the compiler waits for
 // each load in turn at 60-90 VGPRs, and those 2-4 waves per SIMD beat 1 wave of 130-220 VGPRs.
 static constexpr int mmvq_gcn_mc_wpe(const ggml_type type, const int ncols_dst) {
@@ -1566,7 +1568,8 @@ static constexpr int mmvq_gcn_mc_wpe(const ggml_type type, const int ncols_dst) 
     if (mmvq_gcn_mc_type_env(type) != nullptr) {
         return 2;
     }
-    return ncols_dst == 2 || ncols_dst == 5 || (!mmvq_gcn_mc_whole(type) && ncols_dst <= 4) ? 3 : 2;
+    return ncols_dst == 2 || (ncols_dst == 5 && type != GGML_TYPE_Q4_K) ||
+        (!mmvq_gcn_mc_whole(type) && mmvq_gcn_mc_rows(type, ncols_dst) == 2 && ncols_dst <= 4) ? 3 : 2;
 }
 
 // Q4 at 3..4 columns and 3 waves per SIMD loads the columns one after another; 0 = no second variant.
@@ -1589,7 +1592,7 @@ struct mmvq_gcn_mc_args {
 
 template <ggml_type type, int c_ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool gate>
 static void mul_mat_vec_q_gcn_mc_launch(const mmvq_gcn_mc_args & p, cudaStream_t stream) {
-    constexpr int rows = mmvq_gcn_mc_rows(type, gate);
+    constexpr int rows = mmvq_gcn_mc_rows(type, c_ncols_dst, gate);
     const int64_t nblocks = (p.nrows_x + rows*ngroups - 1) / (rows*ngroups);
     const dim3 block_nums(nblocks, p.nchannels_dst, p.nsamples_dst);
     const dim3 block_dims(64, nwarps, 1);
@@ -1686,7 +1689,7 @@ static bool mul_mat_vec_q_gcn_mc_try(const int ncols_dst, const mmvq_gcn_mc_args
     const ggml_cuda_mm_fusion_args_device & f = p.fusion;
     const bool has_fusion = f.gate || f.x_bias || f.gate_bias || f.x_scale || f.gate_scale || f.shared_up;
     const bool gate = f.gate != nullptr;
-    if (!enabled || ncols_dst > 8 || p.nrows_x < mmvq_gcn_mc_rows(type, gate) ||
+    if (!enabled || ncols_dst > 8 || p.nrows_x < mmvq_gcn_mc_rows(type, ncols_dst, gate) ||
             (ncols_dst == 1 && !(type == GGML_TYPE_Q6_K && !has_fusion ? q6_k_1 : one_col)) ||
             (has_fusion && (!fused || f.x_scale || f.gate_scale || f.shared_up || (gate && !mmvq_gcn_mc_q4(type))))) {
         return false;
@@ -1698,7 +1701,7 @@ static bool mul_mat_vec_q_gcn_mc_try(const int ncols_dst, const mmvq_gcn_mc_args
     if (nwarps != 1 && nwarps != 2 && nwarps != 4) {
         // enough waves to fill the card, but at least two K iterations per wave
         constexpr int lpb = mmvq_gcn_mc_whole(type) ? 1 : ggml_cuda_type_traits<type>::qi / get_vdr_mmvq(type);
-        const int     rows        = mmvq_gcn_mc_rows(type, gate);
+        const int     rows        = mmvq_gcn_mc_rows(type, ncols_dst, gate);
         const int64_t nrow_groups = int64_t((p.nrows_x + rows*ngroups - 1) / (rows*ngroups)) * p.nchannels_dst * p.nsamples_dst;
         const int     nchunks_k   = p.ncols_x / ggml_blck_size(type) / ((64/ngroups)/lpb);
         nwarps = 1;
