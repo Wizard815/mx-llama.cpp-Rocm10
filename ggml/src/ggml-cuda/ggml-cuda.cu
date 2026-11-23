@@ -7164,7 +7164,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             graph->n_prop_checks++;
-            if (properties_changed) {
+            // only count a change that invalidates a stable entry: startup churn never captures a graph
+            if (properties_changed && graph->warmup_complete) {
                 graph->n_prop_resets++;
                 if (graph->n_prop_resets >= 4 && graph->n_prop_resets * 10 > graph->n_prop_checks) {
                     graph->unstable_disabled = true;
