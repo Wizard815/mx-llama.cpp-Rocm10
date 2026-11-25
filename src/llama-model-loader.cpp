@@ -1301,6 +1301,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
             size_data -= nbytes;
             n_created++;
+            counted_names.insert(tn.str());
 
             return nullptr;
         }
@@ -1514,9 +1515,25 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         size_data += ggml_nbytes(&t_meta);
     } else {
         n_created++;
+        counted_names.insert(ggml_get_name(&t_meta));
     }
 
     return tensor;
+}
+
+int llama_model_loader::skip_remaining_in_block(int bid) {
+    const std::string prefix = "blk." + std::to_string(bid) + ".";
+    int n = 0;
+    for (const auto & [name, w] : weights_map) {
+        if (name.compare(0, prefix.size(), prefix) != 0 || counted_names.count(name) != 0) {
+            continue;
+        }
+        size_data -= ggml_nbytes(w.tensor);
+        n_created++;
+        counted_names.insert(name);
+        n++;
+    }
+    return n;
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {

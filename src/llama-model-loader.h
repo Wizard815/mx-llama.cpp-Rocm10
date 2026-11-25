@@ -72,6 +72,7 @@ struct llama_model_loader {
     int n_kv      = 0;
     int n_tensors = 0;
     int n_created = 0;
+    std::set<std::string> counted_names; // tensors already counted in n_created (created or skipped)
 
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;
@@ -237,6 +238,11 @@ struct llama_model_loader {
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     void done_getting_tensors(bool partial = false) const;
+
+    // Count the file tensors of block bid that were never requested, for a block that is skipped as a whole
+    // (the MTP blocks when MTP is not loaded): companions such as ".scale"/".input_scale" are only requested
+    // next to a loaded weight, so they would otherwise fail the tensor count. Returns how many were counted.
+    int skip_remaining_in_block(int bid);
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 

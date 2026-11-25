@@ -2485,6 +2485,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // MTP blocks that were not loaded: their companion tensors (".scale", ".input_scale", ...) are only
+    // requested next to a loaded weight, so count whatever of those blocks is left as skipped
+    if (!ml.load_mtp && hparams.n_layer_nextn > 0) {
+        for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+            ml.skip_remaining_in_block((int) il);
+        }
+    }
+
     ml.done_getting_tensors();
 
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
