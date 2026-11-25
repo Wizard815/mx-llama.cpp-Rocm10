@@ -327,6 +327,25 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
 #define GGML_FATTN_TILE_GCN_64_32  256, 2, 64, 32
 #endif
 #endif // GGML_FATTN_TILE_GCN_UPSTREAM_30344
+// Opt-in: -DGGML_FATTN_TILE_GCN_RAYAKAME takes rayakame/llama.cpp-gfx906 469bbca's MI50 rows for head 256 at
+// 1..8 tokens (2..16 columns): 128-thread blocks, nbatch_K 32 (64 for 2 columns). Measured there on MI50 with
+// Qwen3.8 shapes (GQA 6): -5..-30% FA time from 1024 K/V rows on (2-8 tokens), 1 token faster at every length,
+// but 4 and 8 tokens 5-18% slower below 1024 K/V rows (rayakame picks the rows by length; this build uses them
+// always). Build both and A/B.
+#ifdef GGML_FATTN_TILE_GCN_RAYAKAME
+#ifndef GGML_FATTN_TILE_GCN_256_2
+#define GGML_FATTN_TILE_GCN_256_2  128, 3, 64, 64
+#endif
+#ifndef GGML_FATTN_TILE_GCN_256_4
+#define GGML_FATTN_TILE_GCN_256_4  128, 3, 64, 32
+#endif
+#ifndef GGML_FATTN_TILE_GCN_256_8
+#define GGML_FATTN_TILE_GCN_256_8  128, 3, 64, 32
+#endif
+#ifndef GGML_FATTN_TILE_GCN_256_16
+#define GGML_FATTN_TILE_GCN_256_16 128, 2, 64, 32
+#endif
+#endif // GGML_FATTN_TILE_GCN_RAYAKAME
 #define GGML_CUDA_FATTN_TILE_CONFIG_CASE_EXPAND(...) GGML_CUDA_FATTN_TILE_CONFIG_CASE(__VA_ARGS__)
 
 static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_amd_gcn(const int DKQ, const int DV, const int ncols) {
@@ -335,6 +354,15 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
 #else
     // gfx906 sweep: 48.0 vs 59.5 ms at kv 32768 (generic AMD: 256, 2, 32, 128); pp8192 @ d32768 +8.7%
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  64,  64)
+#endif
+#ifdef GGML_FATTN_TILE_GCN_256_2
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE_EXPAND(256, 256,  2, GGML_FATTN_TILE_GCN_256_2)
+#endif
+#ifdef GGML_FATTN_TILE_GCN_256_4
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE_EXPAND(256, 256,  4, GGML_FATTN_TILE_GCN_256_4)
+#endif
+#ifdef GGML_FATTN_TILE_GCN_256_8
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE_EXPAND(256, 256,  8, GGML_FATTN_TILE_GCN_256_8)
 #endif
 #ifdef GGML_FATTN_TILE_GCN_256_16
     GGML_CUDA_FATTN_TILE_CONFIG_CASE_EXPAND(256, 256, 16, GGML_FATTN_TILE_GCN_256_16)
