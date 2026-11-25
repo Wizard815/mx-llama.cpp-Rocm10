@@ -3,6 +3,7 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <cctype>
 #include <cstdint>
 #include <type_traits>
 
@@ -324,7 +325,54 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+// GCN (MI50, Qwen3.8 27B shapes): the most columns for which the mat-vec beats MMQ's 8-column tile, 0 = not measured.
+// With fewer rows MMQ has fewer tiles than the card has blocks and splits K (stream-k), so the mat-vec stays longer.
+static constexpr int get_mmvq_max_batch_gcn(ggml_type type, bool wide) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:    return 8;
+        case GGML_TYPE_Q3_K:    return 8;
+        case GGML_TYPE_Q4_K:    return wide ? 5 : 7;
+        case GGML_TYPE_Q5_K:    return wide ? 5 : 8;
+        case GGML_TYPE_Q6_K:    return 8;
+        case GGML_TYPE_IQ3_XXS: return 8;
+        case GGML_TYPE_IQ3_S:   return 8;
+        case GGML_TYPE_IQ4_XS:  return 8;
+        default:                return 0;
+    }
+}
+
+// GGML_MMVQ_GCN_TABLE=0 keeps the mat-vec up to 8 columns for every type; GGML_MMVQ_GCN_MAX=n and
+// GGML_MMVQ_GCN_MAX_<TYPE>=n (e.g. GGML_MMVQ_GCN_MAX_Q4_K) override the table for the types in it, at any row count;
+// GGML_MMVQ_GCN_ROWS sets the row count from which the wide column of the table applies (8192).
+static int get_mmvq_max_batch_gcn_env(const ggml_type type, const int64_t nrows_x) {
+    const auto env = [](const std::string & name, const int def) {
+        const char * s = getenv(name.c_str());
+        return s ? atoi(s) : def;
+    };
+    static const int wide_rows = env("GGML_MMVQ_GCN_ROWS", 8192);
+    static const std::array<std::array<int, 2>, GGML_TYPE_COUNT> max_batch = [&env] {
+        const bool table = env("GGML_MMVQ_GCN_TABLE", 1) != 0;
+        const int  all   = env("GGML_MMVQ_GCN_MAX", 0);
+        std::array<std::array<int, 2>, GGML_TYPE_COUNT> r;
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            for (int wide = 0; wide < 2; ++wide) {
+                int n = MMVQ_MAX_BATCH_SIZE;
+                if (get_mmvq_max_batch_gcn(ggml_type(t), wide) > 0) {
+                    n = table ? get_mmvq_max_batch_gcn(ggml_type(t), wide) : n;
+                    n = all > 0 ? all : n;
+                    std::string name = std::string("GGML_MMVQ_GCN_MAX_") + ggml_type_name(ggml_type(t));
+                    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::toupper(c); });
+                    n = env(name, n);
+                }
+                r[t][wide] = std::clamp(n, 1, MMVQ_MAX_BATCH_SIZE);
+            }
+        }
+        return r;
+    }();
+    return max_batch[type][nrows_x >= wide_rows];
+}
+
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11, int64_t nrows_x) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
@@ -441,16 +489,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
-    // VEGA20 devices are the only devices with dense MMQ -> ggml_cuda_should_use_mmq()
-    if (cc == GGML_CUDA_CC_VEGA20) {
-        switch (type) { // tuned on MI50 (gfx906)
-            case GGML_TYPE_Q4_K:
-                return ne11 <= 7;
-            case GGML_TYPE_NVFP4:
-                return ne11 <= 6;
-            default:
-                return ne11 <= MMVQ_MAX_BATCH_SIZE;
-        }
+    // NVFP4 keeps upstream's MI50 tuning (#32805); the other types follow the per-type GCN table
+    if (cc == GGML_CUDA_CC_VEGA20 && type == GGML_TYPE_NVFP4) {
+        return ne11 <= 6;
+    }
+    if (GGML_CUDA_CC_IS_GCN(cc)) {
+        return ne11 <= get_mmvq_max_batch_gcn_env(type, nrows_x);
     }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }
@@ -477,6 +521,28 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
+// Rows per block and warps for the GCN register-cached Q4_0/Q4_1 path: 2..4 columns (the MTP verify pass) and 5..8.
+#ifndef GCN_MMVQ_Q4_RPB
+#define GCN_MMVQ_Q4_RPB 4
+#endif
+#ifndef GCN_MMVQ_Q4_NW
+#define GCN_MMVQ_Q4_NW 1
+#endif
+#ifndef GCN_MMVQ_Q4_RPB8
+#define GCN_MMVQ_Q4_RPB8 4
+#endif
+#ifndef GCN_MMVQ_Q4_NW8
+#define GCN_MMVQ_Q4_NW8 1
+#endif
+// 5..8 columns read their weights faster with half a block per thread, whatever VDR the type uses elsewhere.
+#ifndef GCN_MMVQ_Q4_VDR8
+#define GCN_MMVQ_Q4_VDR8 2
+#endif
+
+static constexpr __host__ __device__ bool mmvq_gcn_q4_multicol(ggml_type type, int ncols_dst, int table_id) {
+    return table_id == MMVQ_PARAMETERS_GCN && (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1) && ncols_dst >= 2 && ncols_dst <= 8;
+}
+
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
@@ -494,6 +560,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 return 1;
         }
     } else if (table_id == MMVQ_PARAMETERS_GCN) {
+        if (mmvq_gcn_q4_multicol(type, ncols_dst, table_id)) {
+            return ncols_dst <= 4 ? GCN_MMVQ_Q4_NW : GCN_MMVQ_Q4_NW8;
+        }
         switch (ncols_dst) {
             case 1:
                 return 2;
@@ -647,6 +716,9 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (mmvq_gcn_q4_multicol(type, ncols_dst, table_id)) {
+        return ncols_dst <= 4 ? GCN_MMVQ_Q4_RPB : GCN_MMVQ_Q4_RPB8;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10 || table_id == MMVQ_PARAMETERS_RDNA1) {
         switch (ncols_dst) {
             case 1:
@@ -726,8 +798,8 @@ static __global__ void mul_mat_vec_q(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+    constexpr int vdr = mmvq_gcn_q4_multicol(type, ncols_dst, table_id) && ncols_dst > 4 ? GCN_MMVQ_Q4_VDR8 : get_vdr_mmvq(type);
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -859,6 +931,85 @@ static __global__ void mul_mat_vec_q(
         }
 #endif
 
+#if defined(GGML_USE_HIP) && defined(GCN)
+        // Each column's activations are otherwise re-read through L1 for every row; on Vega that read is the
+        // bottleneck of the 4-column MTP verify pass (after JeanP00l/mi50-qwen3.8-fast, ported to Q4_1 and the gate).
+        if constexpr (mmvq_gcn_q4_multicol(type, ncols_dst, table_id)) {
+            constexpr bool is_q4_0 = type == GGML_TYPE_Q4_0;
+            int   v[rows_per_cuda_block][vdr];
+            int   vg[has_fusion ? rows_per_cuda_block : 1][vdr];
+            half2 dmx[rows_per_cuda_block];
+            half2 dmg[has_fusion ? rows_per_cuda_block : 1];
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const int ib = kbx_offset + i*stride_row_x + kbx;
+                if constexpr (is_q4_0) {
+                    const block_q4_0 * bx = (const block_q4_0 *) vx + ib;
+#pragma unroll
+                    for (int l = 0; l < vdr; ++l) {
+                        v[i][l] = get_int_b2(bx->qs, kqs + l);
+                    }
+                    dmx[i] = make_half2(bx->d, bx->d);
+                } else {
+                    const block_q4_1 * bx = (const block_q4_1 *) vx + ib;
+#pragma unroll
+                    for (int l = 0; l < vdr; ++l) {
+                        v[i][l] = get_int_b4(bx->qs, kqs + l);
+                    }
+                    dmx[i] = bx->dm;
+                }
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        if constexpr (is_q4_0) {
+                            const block_q4_0 * bg = (const block_q4_0 *) vgate + ib;
+#pragma unroll
+                            for (int l = 0; l < vdr; ++l) {
+                                vg[i][l] = get_int_b2(bg->qs, kqs + l);
+                            }
+                            dmg[i] = make_half2(bg->d, bg->d);
+                        } else {
+                            const block_q4_1 * bg = (const block_q4_1 *) vgate + ib;
+#pragma unroll
+                            for (int l = 0; l < vdr; ++l) {
+                                vg[i][l] = get_int_b4(bg->qs, kqs + l);
+                            }
+                            dmg[i] = bg->dm;
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const block_q8_1 * by = &y[j*stride_col_y + kby];
+                int u[2*vdr];
+#pragma unroll
+                for (int l = 0; l < vdr; ++l) {
+                    u[2*l+0] = get_int_b4(by->qs, kqs + l);
+                    u[2*l+1] = get_int_b4(by->qs, kqs + l + qi);
+                }
+                const half2 ds = by->ds;
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    if constexpr (is_q4_0) {
+                        tmp[j][i] += vec_dot_q4_0_q8_1_impl<vdr>(v[i], u, __low2float(dmx[i]), ds);
+                    } else {
+                        tmp[j][i] += vec_dot_q4_1_q8_1_impl<vdr>(v[i], u, dmx[i], ds);
+                    }
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            if constexpr (is_q4_0) {
+                                tmp_gate[j][i] += vec_dot_q4_0_q8_1_impl<vdr>(vg[i], u, __low2float(dmg[i]), ds);
+                            } else {
+                                tmp_gate[j][i] += vec_dot_q4_1_q8_1_impl<vdr>(vg[i], u, dmg[i], ds);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
@@ -964,6 +1115,384 @@ static __global__ void mul_mat_vec_q(
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
     }
 }
+
+#if defined(GGML_USE_HIP)
+// GCN at 2..8 columns: Vega's 16 KB L1 does not keep the activations beside the streamed weights, so their L2 reads
+// (1.8x the weight bytes for Q4_1 at 4 columns, 4 rows per wave) were the limit; ngroups row groups share them.
+static constexpr __host__ __device__ int mmvq_gcn_mc_log2(const int x) {
+    return x <= 1 ? 0 : 1 + mmvq_gcn_mc_log2(x/2);
+}
+
+static constexpr __host__ __device__ int mmvq_gcn_mc_nscatter(const int nvals, const int nlanes) {
+    return mmvq_gcn_mc_log2(nvals) < mmvq_gcn_mc_log2(nlanes) ? mmvq_gcn_mc_log2(nvals) : mmvq_gcn_mc_log2(nlanes);
+}
+
+// Sums a[] over aligned groups of nlanes lanes with ~nvals shuffles; afterwards a[k] holds value
+// mmvq_gcn_mc_first(lane) + k for k < nvals >> nscatter, and runs of keep values stay on one lane.
+template <int nvals, int nlanes, int keep = 1, int s = 0>
+static __device__ __forceinline__ void mmvq_gcn_mc_reduce(float * a, const int lane) {
+    if constexpr ((nlanes >> s) > 1) {
+        constexpr int off = nlanes >> (s + 1);
+        constexpr int h   = nvals  >> (s + 1);
+        if constexpr (h >= keep) {
+            const bool up = lane & off;
+#pragma unroll
+            for (int k = 0; k < h; ++k) {
+                const float send = up ? a[k]     : a[k + h];
+                const float mine = up ? a[k + h] : a[k];
+                a[k] = mine + __shfl_xor(send, off, 64);
+            }
+        } else {
+#pragma unroll
+            for (int k = 0; k < keep; ++k) {
+                a[k] += __shfl_xor(a[k], off, 64);
+            }
+        }
+        mmvq_gcn_mc_reduce<nvals, nlanes, keep, s + 1>(a, lane);
+    }
+}
+
+template <int nvals, int nlanes, int keep>
+static __device__ __forceinline__ int mmvq_gcn_mc_first(const int lane) {
+    int first = 0;
+#pragma unroll
+    for (int s = 0; s < mmvq_gcn_mc_nscatter(nvals/keep, nlanes); ++s) {
+        first += lane & (nlanes >> (s + 1)) ? nvals >> (s + 1) : 0;
+    }
+    return first;
+}
+
+static constexpr __host__ __device__ int mmvq_gcn_mc_ncols_p2(const int ncols_dst) {
+    return ncols_dst == 1 ? 1 : (ncols_dst <= 2 ? 2 : (ncols_dst <= 4 ? 4 : 8));
+}
+
+// Types that mul_mat_vec_q_gcn_mc reads one whole block per lane; the others go through mul_mat_vec_q_gcn_grp.
+static constexpr __host__ __device__ bool mmvq_gcn_mc_whole(const ggml_type type) {
+    return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q8_0;
+}
+
+static constexpr __host__ __device__ bool mmvq_gcn_mc_q4(const ggml_type type) {
+    return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1;
+}
+
+// Q4_K holds 2 ints per lane and row: 4 rows share each activation read up to 4 columns, past that the compiler
+// no longer keeps all column loads in flight with 4 rows.
+static constexpr __host__ __device__ int mmvq_gcn_mc_rows(const ggml_type type, const int ncols_dst, const bool gate = false) {
+    return mmvq_gcn_mc_q4(type) ? (gate ? 2 : 4) : type == GGML_TYPE_Q8_0 ? 4 : (type == GGML_TYPE_Q4_K && ncols_dst <= 4 ? 4 : 2);
+}
+
+// a[(j*rows + i)*nper + m]: partial sums over this lane's K blocks of column j, row row_r + i, of the matrix (m = 0)
+// and, fused, of the gate (m = 1). Rows below row_g belong to the previous group, which moved back from past the end.
+template <int ncols_dst, int rows, int nlanes, int nwarps, bool gate>
+static __device__ __forceinline__ void mmvq_gcn_mc_store(
+        float * a, float * dst, const float * x_bias, const float * gate_bias, const ggml_glu_op glu_op,
+        const float glu_limit, const uint32_t stride_col_dst, const int row_g, const int row_r) {
+    constexpr int nper     = gate ? 2 : 1;
+    constexpr int nvals    = mmvq_gcn_mc_ncols_p2(ncols_dst)*rows*nper;
+    constexpr int nscatter = mmvq_gcn_mc_nscatter(nvals/nper, nlanes);
+    constexpr int nout     = nvals >> nscatter;
+
+    const int lane = threadIdx.x;
+    const int lg   = lane % nlanes;
+
+    mmvq_gcn_mc_reduce<nvals, nlanes, nper>(a, lg);
+
+    if constexpr (nwarps > 1) {
+        __shared__ float red[nwarps - 1][nout][64];
+        if (threadIdx.y > 0) {
+#pragma unroll
+            for (int k = 0; k < nout; ++k) {
+                red[threadIdx.y - 1][k][lane] = a[k];
+            }
+        }
+        __syncthreads();
+        if (threadIdx.y > 0) {
+            return;
+        }
+#pragma unroll
+        for (int w = 0; w < nwarps - 1; ++w) {
+#pragma unroll
+            for (int k = 0; k < nout; ++k) {
+                a[k] += red[w][k][lane];
+            }
+        }
+    }
+
+    if ((lg & ((nlanes >> nscatter) - 1)) != 0) {
+        return;
+    }
+    const int first = mmvq_gcn_mc_first<nvals, nlanes, nper>(lg);
+#pragma unroll
+    for (int k = 0; k < nout; k += nper) {
+        const int o = (first + k) / nper;
+        const int j = o / rows;
+        const int i = o % rows;
+        if (j < ncols_dst && row_r + i >= row_g) {
+            const int id = j*stride_col_dst + row_r + i;
+            float result = a[k];
+            if (x_bias) {
+                result += x_bias[id];
+            }
+            if constexpr (gate) {
+                float gate_value = a[k + 1];
+                if (gate_bias) {
+                    gate_value += gate_bias[id];
+                }
+                switch (glu_op) {
+                    case GGML_GLU_OP_SWIGLU:
+                        result *= ggml_cuda_op_silu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_GEGLU:
+                        result *= ggml_cuda_op_gelu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_OAI:
+                        result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_CLAMP:
+                        result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
+                        break;
+                    default:
+                        result = result * gate_value;
+                        break;
+                }
+            } else {
+                GGML_UNUSED_VARS(gate_bias, glu_op, glu_limit);
+            }
+            dst[id] = result;
+        }
+    }
+}
+
+template <ggml_type type, int ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool gate>
+__launch_bounds__(nwarps*64, waves_per_eu)
+static __global__ void mul_mat_vec_q_gcn_mc(
+        const void * __restrict__ vx, const void * __restrict__ vy, const ggml_cuda_mm_fusion_args_device fusion,
+        float * __restrict__ dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+#if defined(GCN)
+    static_assert(mmvq_gcn_mc_whole(type), "Q4_0/Q4_1/Q8_0 only");
+    constexpr bool is_q4_0  = type == GGML_TYPE_Q4_0;
+    constexpr bool is_q8_0  = type == GGML_TYPE_Q8_0;
+    static_assert(!(is_q8_0 && gate), "gate fusion is Q4 only");
+    constexpr int  nper     = gate ? 2 : 1;
+    constexpr int  rows     = mmvq_gcn_mc_rows(type, ncols_dst, gate);
+    constexpr int  qi       = is_q8_0 ? QI8_0 : 4;
+    constexpr int  nu       = is_q8_0 ? qi : 2*qi;
+    constexpr int  nlanes   = 64/ngroups;
+    constexpr int  nvals    = mmvq_gcn_mc_ncols_p2(ncols_dst)*rows*nper;
+    constexpr int  bs       = is_q4_0 ? sizeof(block_q4_0) : is_q8_0 ? sizeof(block_q8_0) : sizeof(block_q4_1);
+
+    const int lane  = threadIdx.x;
+    const int lg    = lane % nlanes;
+    const int rowb  = blockIdx.x*ngroups*rows;
+    const int row_g = rowb + (lane/nlanes)*rows;
+    // a group past the end moves back to end at the last row and writes only its own rows; nrows_x >= rows
+    const int row_r = row_g + rows <= int(nrows_x) ? row_g : int(nrows_x) - rows;
+    const int rowb_r = rowb < int(nrows_x) - rows ? rowb : int(nrows_x) - rows;
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t sample_dst  = blockIdx.z;
+    const uint32_t channel_x   = fastdiv(channel_dst, channel_ratio);
+    const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+
+    const size_t xoff = (size_t(sample_x*stride_sample_x + channel_x*stride_channel_x) + size_t(rowb_r)*stride_row_x)*bs;
+    const char * x0 = (const char *) vx + xoff;
+    [[maybe_unused]] const char * g0 = gate ? (const char *) fusion.gate + xoff : nullptr;
+    const block_q8_1 * y = (const block_q8_1 *) vy + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
+    const uint32_t row_bytes = stride_row_x*bs;
+    const uint32_t offx0     = uint32_t(row_r - rowb_r)*row_bytes;
+
+    float a[nvals] = {0.0f};
+
+    const int blocks_per_row = ncols_x/ggml_cuda_type_traits<type>::qk;
+    for (int kb = threadIdx.y*nlanes + lg; kb < blocks_per_row; kb += nwarps*nlanes) {
+        // weight row r: row r/nper of the matrix (r%nper == 0) or of the gate
+        int   v[rows*nper][qi];
+        half2 dm[rows*nper];
+#pragma unroll
+        for (int r = 0; r < rows*nper; ++r) {
+            const int i = r/nper;
+            const char * bxc = (r % nper ? g0 : x0) + (offx0 + uint32_t(kb)*bs + i*row_bytes);
+            if constexpr (is_q4_0 || is_q8_0) {
+                using block_t = std::conditional_t<is_q4_0, block_q4_0, block_q8_0>;
+                const block_t * bx = (const block_t *) bxc;
+#pragma unroll
+                for (int l = 0; l < qi; ++l) {
+                    v[r][l] = get_int_b2(bx->qs, l);
+                }
+                dm[r] = make_half2(bx->d, bx->d);
+            } else {
+                const block_q4_1 * bx = (const block_q4_1 *) bxc;
+#pragma unroll
+                for (int l = 0; l < qi; ++l) {
+                    v[r][l] = get_int_b4(bx->qs, l);
+                }
+                dm[r] = bx->dm;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const block_q8_1 * by = (const block_q8_1 *) ((const char *) (y + j*stride_col_y) + uint32_t(kb)*uint32_t(sizeof(block_q8_1)));
+            int u[nu];
+#pragma unroll
+            for (int l = 0; l < qi; ++l) {
+                if constexpr (is_q8_0) {
+                    u[l] = get_int_b4(by->qs, l);
+                } else {
+                    u[2*l+0] = get_int_b4(by->qs, l);
+                    u[2*l+1] = get_int_b4(by->qs, l + qi);
+                }
+            }
+            const half2 ds = by->ds;
+#pragma unroll
+            for (int r = 0; r < rows*nper; ++r) {
+                if constexpr (is_q4_0) {
+                    a[j*rows*nper + r] += vec_dot_q4_0_q8_1_impl<qi>(v[r], u, __low2float(dm[r]), ds);
+                } else if constexpr (is_q8_0) {
+                    a[j*rows*nper + r] += vec_dot_q8_0_q8_1_impl<float, qi>(v[r], u, __low2float(dm[r]), __low2float(ds));
+                } else {
+                    a[j*rows*nper + r] += vec_dot_q4_1_q8_1_impl<qi>(v[r], u, dm[r], ds);
+                }
+            }
+        }
+    }
+
+    const uint32_t dst_offset = sample_dst*stride_sample_dst + channel_dst*stride_channel_dst;
+    mmvq_gcn_mc_store<ncols_dst, rows, nlanes, nwarps, gate>(a, dst + dst_offset,
+        fusion.x_bias ? (const float *) fusion.x_bias + dst_offset : nullptr,
+        gate && fusion.gate_bias ? (const float *) fusion.gate_bias + dst_offset : nullptr,
+        fusion.glu_op, fusion.glu_limit, stride_col_dst, row_g, row_r);
+#else
+    GGML_UNUSED_VARS(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, channel_ratio,
+        stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y,
+        stride_sample_dst);
+    NO_DEVICE_CODE;
+#endif // defined(GCN)
+}
+
+using mmvq_gcn_i32x4 = __attribute__((ext_vector_type(4))) int;
+
+// buf[l]: the 16-byte chunk src[l] of the q8_1 tile that starts at superblock kb; a superblock past the end of the row
+// loads the first one of the tile again, nobody reads it
+template <int qk, int nld, int nsb, int cpc>
+static __device__ __forceinline__ void mmvq_gcn_grp_tile_load(mmvq_gcn_i32x4 * buf, const char * y, const uint32_t * src,
+        const int * sbc, const int kb, const int blocks_per_row) {
+    const uint32_t o = kb*uint32_t((qk/QK8_1)*sizeof(block_q8_1));
+#pragma unroll
+    for (int l = 0; l < nld; ++l) {
+        const bool ok = nsb == 1 || kb + sbc[l] < blocks_per_row;
+        buf[l] = *(const mmvq_gcn_i32x4 *) (y + (o + (ok ? src[l] : src[l] - sbc[l]*(cpc/nsb)*16)));
+    }
+}
+
+template <ggml_type type, int ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool lds>
+__launch_bounds__(nwarps*64, waves_per_eu)
+static __global__ void mul_mat_vec_q_gcn_grp(
+        const void * __restrict__ vx, const void * __restrict__ vy, const ggml_cuda_mm_fusion_args_device fusion,
+        float * __restrict__ dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+#if defined(GCN)
+    constexpr bool gate  = false;
+    constexpr int qk     = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi     = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr    = get_vdr_mmvq(type);
+    constexpr int rows   = mmvq_gcn_mc_rows(type, ncols_dst);
+    constexpr int nlanes = 64/ngroups;
+    constexpr int lpb    = qi/vdr;
+    static_assert(nlanes % lpb == 0, "a group must cover whole blocks");
+    constexpr int nvals  = mmvq_gcn_mc_ncols_p2(ncols_dst)*rows;
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const int lane  = threadIdx.x;
+    const int lg    = lane % nlanes;
+    const int rowb  = blockIdx.x*ngroups*rows;
+    const int row_g = rowb + (lane/nlanes)*rows;
+    const int row_r = row_g + rows <= int(nrows_x) ? row_g : int(nrows_x) - rows;
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t sample_dst  = blockIdx.z;
+    const uint32_t channel_x   = fastdiv(channel_dst, channel_ratio);
+    const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+
+    const block_q8_1 * y = (const block_q8_1 *) vy + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
+    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row_r*stride_row_x;
+
+    float a[nvals] = {0.0f};
+
+    const int blocks_per_row = ncols_x/qk;
+    const int lk  = threadIdx.y*nlanes + lg;
+    const int kqs = vdr*(lk % lpb);
+    if constexpr (lds) {
+        // The row groups of a wave read the same activations: the wave copies them once per K step into LDS.
+        constexpr int nsb    = nlanes/lpb;
+        constexpr int nby    = nsb*(qk/QK8_1);
+        constexpr int cpc    = nby*int(sizeof(block_q8_1))/16;
+        constexpr int nchunk = ncols_dst*cpc;
+        constexpr int nld    = (nchunk + 63)/64;
+        constexpr int kstep  = nwarps*nsb;
+        static_assert(nby*sizeof(block_q8_1) % 16 == 0, "the tile of a column must be whole 16-byte chunks");
+        __shared__ mmvq_gcn_i32x4 tile[nwarps][nld*64];
+        const block_q8_1 * ty = (const block_q8_1 *) tile[threadIdx.y] + (lg/lpb)*(qk/QK8_1);
+
+        uint32_t src[nld];
+        int      sbc[nld];
+#pragma unroll
+        for (int l = 0; l < nld; ++l) {
+            const int c = min(l*64 + lane, nchunk - 1);
+            src[l] = (c/cpc)*stride_col_y*uint32_t(sizeof(block_q8_1)) + (c % cpc)*16;
+            sbc[l] = (c % cpc)/(cpc/nsb);
+        }
+        for (int kb0 = threadIdx.y*nsb; kb0 < blocks_per_row; kb0 += kstep) {
+            mmvq_gcn_i32x4 buf[nld];
+            mmvq_gcn_grp_tile_load<qk, nld, nsb, cpc>(buf, (const char *) y, src, sbc, kb0, blocks_per_row);
+#pragma unroll
+            for (int l = 0; l < nld; ++l) {
+                tile[threadIdx.y][l*64 + lane] = buf[l];
+            }
+            // no barrier: a wave runs its LDS accesses in order, and one would keep the weight loads behind the copy
+            const int kbx = kb0 + lg/lpb;
+            if (nsb == 1 || kbx < blocks_per_row) {
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                    for (int i = 0; i < rows; ++i) {
+                        a[j*rows + i] += vec_dot_q_cuda(vx, ty + j*nby, kbx_offset + i*stride_row_x + kbx, kqs);
+                    }
+                }
+            }
+        }
+    } else {
+        for (int kbx = lk/lpb; kbx < blocks_per_row; kbx += nwarps*nlanes/lpb) {
+            const int kby = kbx*(qk/QK8_1);
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows; ++i) {
+                    a[j*rows + i] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                }
+            }
+        }
+    }
+
+    const uint32_t dst_offset = sample_dst*stride_sample_dst + channel_dst*stride_channel_dst;
+    mmvq_gcn_mc_store<ncols_dst, rows, nlanes, nwarps, gate>(a, dst + dst_offset,
+        fusion.x_bias ? (const float *) fusion.x_bias + dst_offset : nullptr,
+        gate && fusion.gate_bias ? (const float *) fusion.gate_bias + dst_offset : nullptr,
+        fusion.glu_op, fusion.glu_limit, stride_col_dst, row_g, row_r);
+#else
+    GGML_UNUSED_VARS(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, channel_ratio,
+        stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y,
+        stride_sample_dst);
+    NO_DEVICE_CODE;
+#endif // defined(GCN)
+}
+#endif // defined(GGML_USE_HIP)
 
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
@@ -1134,6 +1663,192 @@ static std::pair<dim3, dim3> calc_launch_params(
     const dim3 block_dims(warp_size, nwarps, 1);
     return {block_nums, block_dims};
 }
+
+#if defined(GGML_USE_HIP)
+// The types that reach the row-group kernel with their own vec_dot, each with its own switch.
+static constexpr const char * mmvq_gcn_mc_type_env(const ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_K:    return "GGML_MMVQ_GCN_MC_Q2K";
+        case GGML_TYPE_Q3_K:    return "GGML_MMVQ_GCN_MC_Q3K";
+        case GGML_TYPE_IQ2_S:   return "GGML_MMVQ_GCN_MC_IQ2S";
+        case GGML_TYPE_IQ3_XXS: return "GGML_MMVQ_GCN_MC_IQ3XXS";
+        case GGML_TYPE_IQ3_S:   return "GGML_MMVQ_GCN_MC_IQ3S";
+        case GGML_TYPE_IQ4_NL:  return "GGML_MMVQ_GCN_MC_IQ4NL";
+        case GGML_TYPE_IQ4_XS:  return "GGML_MMVQ_GCN_MC_IQ4XS";
+        default:                return nullptr;
+    }
+}
+
+// Q4 at 2 and 5 columns fits 84 VGPRs (3 waves per SIMD) either way, 6..8 spill there; 3..4 hoist all loads at 2
+// waves. The K-quants stay below 84 VGPRs up to 5 columns anyway. One column: Q6_K fits 40 VGPRs, Q4 48.
+// Q8_0 takes the Q4 shapes but spills at 3 columns and 3 waves. Q4_K at 5 loads the columns one after another at 3 waves.
+// IQ, Q2_K and Q3_K: up to 128 VGPRs they issue their loads together; where they need more, the compiler waits for
+// each load in turn at 60-90 VGPRs, and those 2-4 waves per SIMD beat 1 wave of 130-220 VGPRs.
+static constexpr int mmvq_gcn_mc_wpe(const ggml_type type, const int ncols_dst) {
+    if (ncols_dst == 1) {
+        return mmvq_gcn_mc_whole(type) ? 5 : 6;
+    }
+    if (mmvq_gcn_mc_type_env(type) != nullptr) {
+        return 2;
+    }
+    return ncols_dst == 2 || (ncols_dst == 5 && type != GGML_TYPE_Q4_K) ||
+        (!mmvq_gcn_mc_whole(type) && mmvq_gcn_mc_rows(type, ncols_dst) == 2 && ncols_dst <= 4) ? 3 : 2;
+}
+
+// Q4 at 3..4 columns and 3 waves per SIMD loads the columns one after another; 0 = no second variant.
+static constexpr int mmvq_gcn_mc_wpe_alt(const ggml_type type, const int ncols_dst) {
+    return mmvq_gcn_mc_whole(type) && (ncols_dst == 4 || (ncols_dst == 3 && mmvq_gcn_mc_q4(type))) ? 3 : 0;
+}
+
+static int mmvq_gcn_mc_env(const char * name, const int def) {
+    const char * s = getenv(name);
+    return s ? atoi(s) : def;
+}
+
+struct mmvq_gcn_mc_args {
+    const void * vx;
+    const void * vy;
+    ggml_cuda_mm_fusion_args_device fusion;
+    float * dst;
+    int ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst;
+    uint3 channel_ratio;
+    int stride_channel_x, stride_channel_y, stride_channel_dst;
+    uint3 sample_ratio;
+    int stride_sample_x, stride_sample_y, stride_sample_dst;
+    int nchannels_dst, nsamples_dst;
+};
+
+template <ggml_type type, int c_ncols_dst, int ngroups, int nwarps, int waves_per_eu, bool gate>
+static void mul_mat_vec_q_gcn_mc_launch(const mmvq_gcn_mc_args & p, cudaStream_t stream) {
+    constexpr int rows = mmvq_gcn_mc_rows(type, c_ncols_dst, gate);
+    const int64_t nblocks = (p.nrows_x + rows*ngroups - 1) / (rows*ngroups);
+    const dim3 block_nums(nblocks, p.nchannels_dst, p.nsamples_dst);
+    const dim3 block_dims(64, nwarps, 1);
+    if constexpr (mmvq_gcn_mc_whole(type)) {
+        mul_mat_vec_q_gcn_mc<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, gate><<<block_nums, block_dims, 0, stream>>>(
+            p.vx, p.vy, p.fusion, p.dst, p.ncols_x, p.nrows_x, p.stride_row_x, p.stride_col_y, p.stride_col_dst,
+            p.channel_ratio, p.stride_channel_x, p.stride_channel_y, p.stride_channel_dst, p.sample_ratio,
+            p.stride_sample_x, p.stride_sample_y, p.stride_sample_dst);
+    } else {
+        static_assert(!gate, "gate fusion is Q4 only");
+        static const bool lds = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_LDS", 1) != 0;
+        auto kernel = mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, false>;
+        // measured for Q5_K/Q6_K only
+        if constexpr (c_ncols_dst > 1 && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
+            if (lds) {
+                kernel = mul_mat_vec_q_gcn_grp<type, c_ncols_dst, ngroups, nwarps, waves_per_eu, true>;
+            }
+        }
+        kernel<<<block_nums, block_dims, 0, stream>>>(
+            p.vx, p.vy, p.fusion, p.dst, p.ncols_x, p.nrows_x, p.stride_row_x, p.stride_col_y, p.stride_col_dst,
+            p.channel_ratio, p.stride_channel_x, p.stride_channel_y, p.stride_channel_dst, p.sample_ratio,
+            p.stride_sample_x, p.stride_sample_y, p.stride_sample_dst);
+    }
+}
+
+template <ggml_type type, int c_ncols_dst, int waves_per_eu, bool gate>
+static void mul_mat_vec_q_gcn_mc_switch_shape(const int ngroups, const int nwarps, const mmvq_gcn_mc_args & p, cudaStream_t stream) {
+    if (ngroups == 2 && !gate) {
+        switch (nwarps) {
+            case 1:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 1, waves_per_eu, false>(p, stream); break;
+            case 2:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 2, waves_per_eu, false>(p, stream); break;
+            default: mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 2, 4, waves_per_eu, false>(p, stream); break;
+        }
+    } else {
+        switch (nwarps) {
+            case 1:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 1, waves_per_eu, gate>(p, stream); break;
+            case 2:  mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 2, waves_per_eu, gate>(p, stream); break;
+            default: mul_mat_vec_q_gcn_mc_launch<type, c_ncols_dst, 4, 4, waves_per_eu, gate>(p, stream); break;
+        }
+    }
+}
+
+template <ggml_type type, int c_ncols_dst, bool gate>
+static void mul_mat_vec_q_gcn_mc_switch_wpe(const int waves_per_eu, const int ngroups, const int nwarps,
+        const mmvq_gcn_mc_args & p, cudaStream_t stream) {
+    if constexpr (mmvq_gcn_mc_wpe_alt(type, c_ncols_dst) != 0 && !gate) {
+        if (waves_per_eu == mmvq_gcn_mc_wpe_alt(type, c_ncols_dst)) {
+            mul_mat_vec_q_gcn_mc_switch_shape<type, c_ncols_dst, mmvq_gcn_mc_wpe_alt(type, c_ncols_dst), false>(
+                ngroups, nwarps, p, stream);
+            return;
+        }
+    }
+    mul_mat_vec_q_gcn_mc_switch_shape<type, c_ncols_dst, mmvq_gcn_mc_wpe(type, c_ncols_dst), gate>(ngroups, nwarps, p, stream);
+    GGML_UNUSED(waves_per_eu);
+}
+
+template <ggml_type type, bool gate>
+static bool mul_mat_vec_q_gcn_mc_switch_ncols(const int ncols_dst, const int waves_per_eu, const int ngroups,
+        const int nwarps, const mmvq_gcn_mc_args & p, cudaStream_t stream) {
+    switch (ncols_dst) {
+        case 1:
+            // the Q6_K output head of the MTP drafts (248k rows), and the others on request
+            if constexpr ((!gate || mmvq_gcn_mc_q4(type)) && mmvq_gcn_mc_type_env(type) == nullptr) {
+                mul_mat_vec_q_gcn_mc_switch_wpe<type, 1, gate>(waves_per_eu, ngroups, nwarps, p, stream);
+                return true;
+            }
+            return false;
+        case 2: mul_mat_vec_q_gcn_mc_switch_wpe<type, 2, gate>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 3: mul_mat_vec_q_gcn_mc_switch_wpe<type, 3, gate>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 4: mul_mat_vec_q_gcn_mc_switch_wpe<type, 4, gate>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 5: mul_mat_vec_q_gcn_mc_switch_wpe<type, 5, gate>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 6: mul_mat_vec_q_gcn_mc_switch_wpe<type, 6, gate>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 7: mul_mat_vec_q_gcn_mc_switch_wpe<type, 7, gate>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        case 8: mul_mat_vec_q_gcn_mc_switch_wpe<type, 8, gate>(waves_per_eu, ngroups, nwarps, p, stream); return true;
+        default: return false;
+    }
+}
+
+// A/B switches, 0 = old path: GGML_MMVQ_GCN_MC, _K (Q4_K/Q5_K/Q6_K), _Q4K (Q4_K), _Q8 (Q8_0), _Q2K, _Q3K, _IQ2S,
+// _IQ3XXS, _IQ3S, _IQ4NL, _IQ4XS, _LDS (Q5_K/Q6_K activations through LDS), _Q6K1 (1-column Q6_K), _FUSED; _1COL=1
+// adds the other 1-column calls of Q4_0/Q4_1/Q5_K; _GROUPS (2|4), _WARPS (1|2|4), _WPE (2|3) override the shapes chosen below.
+template <ggml_type type>
+static bool mul_mat_vec_q_gcn_mc_try(const int ncols_dst, const mmvq_gcn_mc_args & p, cudaStream_t stream) {
+    constexpr const char * type_env = mmvq_gcn_mc_type_env(type);
+    static const bool enabled     = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC", 1) != 0 &&
+        (type_env ? mmvq_gcn_mc_env(type_env, 1) != 0 :
+            mmvq_gcn_mc_q4(type) ||
+            mmvq_gcn_mc_env(type == GGML_TYPE_Q8_0 ? "GGML_MMVQ_GCN_MC_Q8" : "GGML_MMVQ_GCN_MC_K", 1) != 0) &&
+        (type != GGML_TYPE_Q4_K || mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_Q4K", 1) != 0);
+    static const bool q6_k_1      = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_Q6K1", 1) != 0;
+    static const bool one_col     = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_1COL", 0) != 0;
+    static const bool fused       = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_FUSED", 1) != 0;
+    static const int  env_ngroups = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_GROUPS", 0);
+    static const int  env_nwarps  = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_WARPS", 0);
+    static const int  env_wpe     = mmvq_gcn_mc_env("GGML_MMVQ_GCN_MC_WPE", 0);
+
+    const ggml_cuda_mm_fusion_args_device & f = p.fusion;
+    const bool has_fusion = f.gate || f.x_bias || f.gate_bias || f.x_scale || f.gate_scale || f.shared_up;
+    const bool gate = f.gate != nullptr;
+    if (!enabled || ncols_dst > 8 || p.nrows_x < mmvq_gcn_mc_rows(type, ncols_dst, gate) ||
+            (ncols_dst == 1 && !(type == GGML_TYPE_Q6_K && !has_fusion ? q6_k_1 : one_col)) ||
+            (has_fusion && (!fused || f.x_scale || f.gate_scale || f.shared_up || (gate && !mmvq_gcn_mc_q4(type))))) {
+        return false;
+    }
+
+    const int waves_per_eu = env_wpe == 3 ? 3 : 2;
+    const int ngroups      = env_ngroups == 2 && !gate ? 2 : 4;
+    int nwarps = env_nwarps;
+    if (nwarps != 1 && nwarps != 2 && nwarps != 4) {
+        // enough waves to fill the card, but at least two K iterations per wave
+        constexpr int lpb = mmvq_gcn_mc_whole(type) ? 1 : ggml_cuda_type_traits<type>::qi / get_vdr_mmvq(type);
+        const int     rows        = mmvq_gcn_mc_rows(type, ncols_dst, gate);
+        const int64_t nrow_groups = int64_t((p.nrows_x + rows*ngroups - 1) / (rows*ngroups)) * p.nchannels_dst * p.nsamples_dst;
+        const int     nchunks_k   = p.ncols_x / ggml_blck_size(type) / ((64/ngroups)/lpb);
+        nwarps = 1;
+        while (nwarps < 4 && nrow_groups*nwarps < 2048 && nchunks_k >= 4*nwarps) {
+            nwarps *= 2;
+        }
+    }
+
+    if constexpr (mmvq_gcn_mc_q4(type)) {
+        if (gate) {
+            return mul_mat_vec_q_gcn_mc_switch_ncols<type, true>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream);
+        }
+    }
+    return mul_mat_vec_q_gcn_mc_switch_ncols<type, false>(ncols_dst, waves_per_eu, ngroups, nwarps, p, stream);
+}
+#endif // defined(GGML_USE_HIP)
 
 template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>
 static void mul_mat_vec_q_switch_fusion(
@@ -1312,6 +2027,22 @@ static void mul_mat_vec_q_switch_ncols_dst(
             ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
         return;
     }
+
+#if defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K ||
+            type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || mmvq_gcn_mc_type_env(type) != nullptr) {
+        if (GGML_CUDA_CC_IS_GCN(cc) && !has_ids) {
+            const mmvq_gcn_mc_args p = {
+                vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, nchannels_dst, nsamples_dst,
+            };
+            if (mul_mat_vec_q_gcn_mc_try<type>(ncols_dst, p, stream)) {
+                return;
+            }
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
     switch (ncols_dst) {
         case 1: {

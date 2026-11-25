@@ -2403,6 +2403,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_batch_tgt = 0;
     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
 
+    // an env setting, not a common_params field, so the library stays a drop-in for the image's other binaries
+    int32_t p_min_pad_seqs = 3;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -2518,6 +2521,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         n_batch_tgt = (int32_t) llama_n_batch(ctx_tgt);
         verify_row0.assign(n_seq, -1);
+
+        if (const char * env = getenv("LLAMA_ARG_SPEC_DRAFT_P_MIN_PAD")) {
+            p_min_pad_seqs = atoi(env);
+        }
+        SPC_TRC("- p_min_pad_seqs=%d\n", p_min_pad_seqs);
 
         // The deferred prefill replay reads host rows from the pre-norm accum, which the device rows would bypass, so they are turned on once it has run.
         if (!deferred_prefill) {
@@ -2974,6 +2982,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        // the verify batch of several sequences splits into one pass per length, so with enough sequences one below
+        // p_min keeps drafting while a confident one does and is cut to the longest confident draft at the end
+        const bool pad = p_min_pad_seqs > 0 && n_drafting >= p_min_pad_seqs;
+
+        std::vector<int32_t> n_confident(n_seq, -1); // draft length when the sequence fell below p_min
+        int n_drafting_confident = n_drafting;
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -3020,6 +3035,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     disable_seq(seq_id, "non-finite draft probability");
                     drafting[seq_id] = false;
                     n_drafting--;
+                    if (n_confident[seq_id] < 0) {
+                        n_drafting_confident--;
+                    }
                     continue;
                 }
 
@@ -3032,18 +3050,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
+                auto & dp = dparams.at(seq_id);
+                auto & result = *dp.result;
+
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
-                    drafting[seq_id] = false;
-                    n_drafting--;
+                    if (!pad) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
 
-                    continue;
+                        continue;
+                    }
+                    if (n_confident[seq_id] < 0) {
+                        n_confident[seq_id] = (int32_t) result.size();
+                        n_drafting_confident--;
+                    }
                 }
 
                 common_sampler_accept(smpl, id, true);
-
-                auto & dp = dparams.at(seq_id);
-                auto & result = *dp.result;
 
                 result.push_back(id);
 
@@ -3054,6 +3078,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
+                    if (n_confident[seq_id] < 0) {
+                        n_drafting_confident--;
+                    }
                     continue;
                 }
 
@@ -3081,7 +3108,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
 
-            if (batch.size() == 0) {
+            if (batch.size() == 0 || (pad && n_drafting_confident == 0)) {
                 break;
             }
 
@@ -3090,6 +3117,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+        }
+
+        if (pad) {
+            size_t n_len = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (dparams[seq_id].drafting) {
+                    n_len = std::max(n_len, n_confident[seq_id] < 0 ? dparams[seq_id].result->size() : (size_t) n_confident[seq_id]);
+                }
+            }
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+                if (!dp.drafting || n_confident[seq_id] < 0 || dp.result->size() <= n_len) {
+                    continue;
+                }
+                dp.result->resize(n_len);
+                if (dp.result_q && dp.result_q->size() > n_len) {
+                    dp.result_q->resize(n_len);
+                }
+            }
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {

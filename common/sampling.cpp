@@ -11,6 +11,7 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <unordered_map>
@@ -109,6 +110,14 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+struct common_sampler_sparse {
+    int32_t k      = 0; // 0: off
+    int32_t n_pre  = 0; // chain samplers before the top-k
+    int32_t n_hist = 0; // last accepted tokens whose logits they can change
+
+    std::vector<llama_token> bias_ids;
+};
+
 struct common_sampler {
     common_params_sampling params;
 
@@ -125,13 +134,22 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // k of a top-k sampler that sees the full vocabulary unchanged, see common_sampler_top_k_first()
+    int32_t top_k_first = 0;
+
+    // a top-k sampler after samplers that change only a few logits, see common_sampler_top_k_sparse()
+    common_sampler_sparse sparse;
+
+    std::vector<llama_token>      sparse_ids;
+    std::vector<llama_token_data> sparse_cand;
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
+    void set_logits(struct llama_context * ctx, int idx, bool top_k_only = false) {
         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
@@ -156,6 +174,14 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
+            if (top_k_only && top_k_first > 0 && top_k_first < n_vocab && top_k_unique(logits, n_vocab, top_k_first, nullptr, 0, cur)) {
+                cur_p = { cur.data(), cur.size(), -1, true };
+                return;
+            }
+            if (top_k_only && sparse.k > 0 && sparse.k < n_vocab && top_k_sparse(logits, n_vocab)) {
+                cur_p = { cur.data(), cur.size(), -1, true };
+                return;
+            }
             cur.resize(n_vocab);
             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
                 cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
@@ -167,6 +193,114 @@ struct common_sampler {
 
     common_time_meas tm() {
         return common_time_meas(t_total_us, params.no_perf);
+    }
+
+    // the top-k of the logits after the samplers before the top-k ran over only the tokens whose logit they can change;
+    // the candidates keep their raw logits, so the chain applies those samplers again exactly as on the full array
+    bool top_k_sparse(const float * logits, int32_t n_vocab) {
+        sparse_ids.assign(sparse.bias_ids.begin(), sparse.bias_ids.end());
+        const int32_t n_hist = std::min<int32_t>(sparse.n_hist, (int32_t) prev.size());
+        for (int32_t i = 0; i < n_hist; ++i) {
+            sparse_ids.push_back(prev.rat(i));
+        }
+        std::sort(sparse_ids.begin(), sparse_ids.end());
+        sparse_ids.erase(std::unique(sparse_ids.begin(), sparse_ids.end()), sparse_ids.end());
+
+        sparse_cand.clear();
+        for (const llama_token id : sparse_ids) {
+            if (id >= 0 && id < n_vocab) {
+                sparse_cand.push_back(llama_token_data{id, logits[id], 0.0f});
+            }
+        }
+
+        llama_token_data_array arr = { sparse_cand.data(), sparse_cand.size(), -1, false };
+        for (int32_t i = 0; i < sparse.n_pre; ++i) {
+            llama_sampler_apply(llama_sampler_chain_get(chain, i), &arr);
+        }
+        if (arr.data != sparse_cand.data() || arr.size != sparse_cand.size()) {
+            return false;
+        }
+
+        if (!top_k_unique(logits, n_vocab, sparse.k, sparse_cand.data(), sparse_cand.size(), cur)) {
+            return false;
+        }
+        for (auto & c : cur) {
+            c.logit = logits[c.id];
+        }
+        return true;
+    }
+
+    // the k largest logits, ovr (sorted by id) replacing some, in the order the top-k sampler leaves them on the full
+    // candidate array; false when equal logits make that order depend on the sort algorithm, then the caller takes the full array
+    static bool top_k_unique(const float * logits, int32_t n, int32_t k, const llama_token_data * ovr, size_t n_ovr, std::vector<llama_token_data> & out) {
+        const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
+            return a.logit > b.logit;
+        };
+
+        size_t o = 0;
+        auto value = [&](int32_t i) {
+            if (o < n_ovr && ovr[o].id == i) {
+                return ovr[o++].logit;
+            }
+            return logits[i];
+        };
+
+        // min-heap of the k + 1 largest, so the boundary to the rest can be checked too
+        out.resize(k + 1);
+        llama_token_data * h = out.data();
+        for (int32_t i = 0; i <= k; ++i) {
+            h[i] = llama_token_data{i, value(i), 0.0f};
+        }
+        std::make_heap(h, h + k + 1, comp);
+
+        float thr = h[0].logit;
+        auto insert = [&](int32_t i, float v) {
+            std::pop_heap(h, h + k + 1, comp);
+            h[k] = llama_token_data{i, v, 0.0f};
+            std::push_heap(h, h + k + 1, comp);
+            thr = h[0].logit;
+        };
+
+        constexpr int32_t block = 64;
+        int32_t i = k + 1;
+        for (; i + block <= n; i += block) {
+            if (o < n_ovr && ovr[o].id < i + block) {
+                for (int32_t j = 0; j < block; ++j) {
+                    const float v = value(i + j);
+                    if (v > thr) {
+                        insert(i + j, v);
+                    }
+                }
+                continue;
+            }
+            int32_t n_above = 0;
+            for (int32_t j = 0; j < block; ++j) {
+                n_above += logits[i + j] > thr;
+            }
+            if (n_above == 0) {
+                continue;
+            }
+            for (int32_t j = 0; j < block; ++j) {
+                if (logits[i + j] > thr) {
+                    insert(i + j, logits[i + j]);
+                }
+            }
+        }
+        for (; i < n; ++i) {
+            const float v = value(i);
+            if (v > thr) {
+                insert(i, v);
+            }
+        }
+
+        std::sort_heap(h, h + k + 1, comp);
+        for (int32_t j = 1; j <= k; ++j) {
+            if (!(h[j - 1].logit > h[j].logit)) {
+                return false;
+            }
+        }
+        out.resize(k);
+        return true;
     }
 
     mutable int64_t t_total_us = 0;
@@ -186,6 +320,100 @@ std::string common_params_sampling::print() const {
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
     return std::string(result);
+}
+
+// k of the first top-k sampler if every sampler the chain runs before it leaves the candidates unchanged
+// (as built by common_sampler_init without a logit bias), else 0
+static int32_t common_sampler_top_k_first(const common_params_sampling & params) {
+    if (params.mirostat != 0 || params.top_k <= 0 || params.top_k > 128) {
+        return 0;
+    }
+    for (const auto & type : params.samplers) {
+        switch (type) {
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                return params.top_k;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (std::max(params.penalty_last_n, 0) != 0 &&
+                    (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (params.dry_multiplier != 0.0f && params.dry_base >= 1.0f && std::max(params.dry_penalty_last_n, 0) != 0) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (params.top_n_sigma > 0.0f) {
+                    return 0;
+                }
+                break;
+            default:
+                return 0;
+        }
+    }
+    return 0;
+}
+
+// the first top-k sampler if the samplers before it change only the logits of the logit bias tokens and of the last
+// accepted tokens (penalties, DRY), else k 0
+static common_sampler_sparse common_sampler_top_k_sparse(const common_params_sampling & params, const std::vector<llama_logit_bias> & bias) {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_SAMPLER_SPARSE_TOPK");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    // above this the sort of the history costs about as much as the full candidate array
+    constexpr int32_t n_max = 4096;
+
+    common_sampler_sparse res;
+    if (!enabled || params.mirostat != 0 || params.top_k <= 0 || params.top_k > 128 || bias.size() > (size_t) n_max) {
+        return res;
+    }
+
+    int32_t n_pre  = bias.empty() ? 0 : 1;
+    int32_t n_hist = 0;
+    for (const auto & type : params.samplers) {
+        switch (type) {
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                if (n_hist > n_max) {
+                    return res;
+                }
+                for (const auto & lb : bias) {
+                    res.bias_ids.push_back(lb.token);
+                }
+                std::sort(res.bias_ids.begin(), res.bias_ids.end());
+                // on the full array the logit bias adds a repeated token's bias twice, on a short array once
+                if (std::adjacent_find(res.bias_ids.begin(), res.bias_ids.end()) != res.bias_ids.end()) {
+                    res.bias_ids.clear();
+                    return res;
+                }
+                res.k      = params.top_k;
+                res.n_pre  = n_pre;
+                res.n_hist = n_hist;
+                return res;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (params.penalty_last_n > 0 &&
+                    (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
+                    n_hist = std::max(n_hist, params.penalty_last_n);
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (params.dry_multiplier != 0.0f && params.dry_base >= 1.0f && params.dry_penalty_last_n > 0) {
+                    n_hist = std::max(n_hist, params.dry_penalty_last_n);
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (params.top_n_sigma > 0.0f) {
+                    return res;
+                }
+                break;
+            default:
+                return res;
+        }
+        ++n_pre;
+    }
+    return res;
 }
 
 struct common_sampler * common_sampler_init(
@@ -219,6 +447,7 @@ struct common_sampler * common_sampler_init(
     llama_sampler * chain = llama_sampler_chain_init(lparams);
 
     std::vector<llama_sampler *> samplers;
+    bool has_logit_bias = false;
 
     const std::string & grammar_str = common_grammar_value(params.grammar);
     if (grammar_str.compare(0, 11, "%llguidance") == 0) {
@@ -335,9 +564,8 @@ struct common_sampler * common_sampler_init(
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
+    std::vector<llama_logit_bias> merged = params.logit_bias;
     {
-        std::vector<llama_logit_bias> merged = params.logit_bias;
-
         int32_t n_suppress = 0;
         const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
         for (int32_t i = 0; i < n_suppress; ++i) {
@@ -346,6 +574,7 @@ struct common_sampler * common_sampler_init(
 
         if (!merged.empty()) {
             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
+            has_logit_bias = true;
         }
     }
 
@@ -439,16 +668,26 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
+    const int32_t top_k_first = has_logit_bias ? 0 : common_sampler_top_k_first(params);
+
+    common_sampler_sparse sparse;
+    if (top_k_first == 0) {
+        sparse = common_sampler_top_k_sparse(params, merged);
+    }
+
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
         /* .rbudget = */ rbudget,
         /* .chain   = */ chain,
-        /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+        // the sparse top-k reads the history the penalties and DRY see
+        /* .prev    = */ ring_buffer<llama_token>(std::max({32, params.n_prev, sparse.n_hist})),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+        /* .top_k_first = */ top_k_first,
+        /* .sparse  = */ std::move(sparse),
     };
 
     return result;
@@ -533,6 +772,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
+        /* .top_k_first = */ gsmpl->top_k_first,
+        /* .sparse  = */ gsmpl->sparse,
     };
 }
 
@@ -554,6 +795,8 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
+    dst->top_k_first = src->top_k_first;
+    dst->sparse     = src->sparse;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -624,7 +867,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    // forcing and a grammar applied first both need every candidate
+    const bool top_k_only =
+        !(rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING) &&
+        !(grammar_first && grammar_should_apply(gsmpl));
+
+    gsmpl->set_logits(ctx, idx, top_k_only);
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
