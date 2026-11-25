@@ -11,6 +11,8 @@ FROM ${BASE_IMAGE}
 # either value runs on MI50/MI60.
 ARG AMDGPU_TARGETS=gfx906
 ARG HIP_FLAGS="-mllvm -amdgpu-sched-strategy=max-ilp"
+# ON: max-ilp per file, all but mmvq.cu (then set HIP_FLAGS to " " so it is not applied twice)
+ARG HIP_MAX_ILP=OFF
 # KV cache types with a compiled FlashAttention vector kernel (decode). A type
 # missing here still works, but every decode step first converts the whole KV
 # cache to f16 ("no FlashAttention vector kernel compiled for K/V types ...").
@@ -33,6 +35,7 @@ RUN HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
       -DCMAKE_CXX_FLAGS="-O3 -Wno-unused-command-line-argument" \
       -DCMAKE_HIP_FLAGS="${HIP_FLAGS}" \
       -DGGML_CUDA_FA_QUANTS="${FA_QUANTS}" \
+      -DGGML_HIP_MAX_ILP="${HIP_MAX_ILP}" \
       -DLLAMA_BUILD_TESTS=OFF \
     && cmake --build build --config Release -j"$(nproc)" \
     && mkdir -p /app \

@@ -219,6 +219,7 @@ option(GGML_HIP_GRAPHS                      "ggml: use HIP graph"               
 # ON by default: the tensor-parallel AllReduce and the meta backend use RCCL when it is present; without it
 # tensor split falls back to the meta-backend butterfly (measured -18.6% prefill, 4x MI50, 4x64K). -DGGML_HIP_RCCL=OFF opts out.
 option(GGML_HIP_RCCL                        "ggml: use ROCm Collective Comm. Library"         ON)
+option(GGML_HIP_MAX_ILP                     "ggml: max-ilp scheduler for HIP files except mmvq.cu (do not also pass it in CMAKE_HIP_FLAGS)" OFF)
 option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"                 ON)
 option(GGML_HIP_MMQ_MFMA                    "ggml: enable MFMA MMA for CDNA in MMQ"           ON)
 option(GGML_HIP_GCN_MMQ_LEGACY              "ggml: use the pre-#30021 GCN MMQ tile table"     OFF)

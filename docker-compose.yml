@@ -13,6 +13,7 @@ services:
         AMDGPU_TARGETS: ${GFX906_AMDGPU_TARGETS:-gfx906}
         HIP_FLAGS: ${GFX906_HIP_FLAGS:--mllvm -amdgpu-sched-strategy=max-ilp}
         FA_QUANTS: ${GFX906_FA_QUANTS:-f16-f16;f16-q8_0;f16-q5_0;f16-q4_0;q8_0-f16;q8_0-q8_0;q8_0-q5_0;q8_0-q4_0;q5_0-f16;q5_0-q8_0;q5_0-q5_0;q5_0-q4_0;q4_0-f16;q4_0-q8_0;q4_0-q5_0;q4_0-q4_0;bf16-bf16}
+        HIP_MAX_ILP: ${GFX906_HIP_MAX_ILP:-OFF}
     image: mx-llama-rocm10-gfx906:local
 
   mx-llamacpp-ssh:
