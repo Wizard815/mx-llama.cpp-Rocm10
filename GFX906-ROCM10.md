@@ -60,6 +60,13 @@ plus these later ggml-org/llama.cpp commits cherry-picked for HIP/GCN:
   is mirrored (also enabled for MTP)
 - Custom all-reduce peer access: let the driver decide, clear the sticky HIP error on refusal
 - `GGML_HIP_RCCL` defaults to ON
+- MTP verify-pass mat-vec from rayakame/llama.cpp-gfx906 (v0.7.0): register-cached and
+  row-group mat-vec kernels for 2..8 token columns (Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, Q8_0, Q2_K,
+  Q3_K and the IQ types), so a draft of several tokens is verified without falling to MMQ; a
+  per-type and per-row-count mat-vec/MMQ switch for GCN (upstream #32805's VEGA20 rule is kept
+  for NVFP4). Q8_0 weights in the repack buffer keep the fork's own repacked path.
+- Exact top-k fast path in `common_sampler` (also with penalties, DRY and a logit bias), and
+  MTP drafts of several requests padded to one length so they verify in one pass (rayakame).
 - `-mllvm -amdgpu-sched-strategy=max-ilp` compiler flag recommended at build time (see below)
 
 ## Now upstream (dropped from this fork)
@@ -88,6 +95,10 @@ no rebuild. Defaults are what a plain launch gets.
 | `GGML_CUDA_NO_ADD_NORM_FUSION=1` | off | residual ADD -> RMS_NORM -> MUL fusion off |
 | `GGML_CUDA_NO_GDN_GATE_FUSION=1` | off | GDN gate ADD -> SOFTPLUS -> MUL (+ SIGMOID) fusion off |
 | `GGML_CUDA_NO_GDN_L2_NORM_PAIR_FUSION=1` | off | GDN q/k l2 norms in one launch off |
+| `GGML_MMVQ_GCN_MC=0` | on | rayakame's 2..8 column row-group mat-vec off. `_MC_Q4K`, `_MC_Q8`, `_MC_Q2K`, `_MC_Q3K`, `_MC_IQ2S`, `_MC_IQ3XXS`, `_MC_IQ3S`, `_MC_IQ4NL`, `_MC_IQ4XS` `=0` turn off one type; `_MC_LDS=0` keeps Q5_K/Q6_K activations out of LDS; `_MC_GROUPS`, `_MC_WARPS`, `_MC_WPE` set the shape |
+| `GGML_MMVQ_GCN_TABLE=0` | on | the per-type mat-vec/MMQ column limit on GCN off. `GGML_MMVQ_GCN_MAX=n` or `GGML_MMVQ_GCN_MAX_<TYPE>=n` set the limit, `GGML_MMVQ_GCN_ROWS` (8192) the row count that splits the table |
+| `LLAMA_SAMPLER_SPARSE_TOPK=0` | on | exact top-k fast path in the common sampler off |
+| `LLAMA_ARG_SPEC_DRAFT_P_MIN_PAD=n` | 3 | from n drafting requests on, an MTP draft below p-min is padded to the longest confident one so all verify in one pass; 0 = off |
 | `GGML_CUDA_FEWROW_F32=0/512/1024` | 1 (auto) | few-row F32 mat-vec on GCN: off, or a forced block size |
 | `GGML_GDN_NO_COLTHREAD=1` | off | skip mx's column-thread GDN kernel; the chunked kernel and its gfx906 tuning run instead |
 | `GGML_CUDA_GDN_DECODE_MC=1` | off | GDN decode multi-column layout (measured slower; only reached with `GGML_GDN_NO_COLTHREAD=1`) |
