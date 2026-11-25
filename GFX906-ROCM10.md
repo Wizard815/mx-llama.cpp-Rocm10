@@ -103,6 +103,7 @@ no rebuild. Defaults are what a plain launch gets.
 | `LLAMA_MTP_TENSOR_MIRROR=1` | off | MTP under `-sm tensor`: mirror the output head so the GPU sampler can run |
 | `LLAMA_MTP_DRAFT_VOCAB=K` | off | MTP draft scores only the first K token ids (layer split) |
 | `LLAMA_MOE_RANDOM_ROUTING=1` | off | benchmark only: random expert choice, for MoE cache tests |
+| `GGML_HIP_GRAPH_REINSTANTIATE=1` | off | re-instantiate HIP graphs instead of `hipGraphExecUpdate`, which leaks ~1 MiB per request on ROCm (issue 10713) |
 
 ## Build
 

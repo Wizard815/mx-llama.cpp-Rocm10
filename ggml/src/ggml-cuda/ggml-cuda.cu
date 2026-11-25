@@ -4547,7 +4547,14 @@ static bool ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
         funcs_changed = funcs != kernel_funcs;
         kernel_funcs = std::move(funcs);
     }
-    if (funcs_changed) {
+    // GGML_HIP_GRAPH_REINSTANTIATE=1: never call hipGraphExecUpdate. ROCm's update allocates new kernel argument
+    // memory on every call and frees it only with the executable (ROCm rocm-systems issue 10713, about 1 MiB a
+    // request on a server, found by rayakame/llama.cpp-gfx906); re-instantiating costs some time per update instead.
+    static const bool always_reinstantiate = [] {
+        const char * e = getenv("GGML_HIP_GRAPH_REINSTANTIATE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (funcs_changed || always_reinstantiate) {
         GGML_LOG_DEBUG("%s: HIP: kernel set changed, re-instantiating graph exec\n", __func__);
         CUDA_CHECK(cudaGraphExecDestroy(instance));
         instance.handle = nullptr;
