@@ -60,6 +60,13 @@ plus these later ggml-org/llama.cpp commits cherry-picked for HIP/GCN:
   is mirrored (also enabled for MTP)
 - Custom all-reduce peer access: let the driver decide, clear the sticky HIP error on refusal
 - `GGML_HIP_RCCL` defaults to ON
+- MTP verify-pass mat-vec from rayakame/llama.cpp-gfx906 (v0.7.0): register-cached and
+  row-group mat-vec kernels for 2..8 token columns (Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, Q8_0, Q2_K,
+  Q3_K and the IQ types), so a draft of several tokens is verified without falling to MMQ; a
+  per-type and per-row-count mat-vec/MMQ switch for GCN (upstream #32805's VEGA20 rule is kept
+  for NVFP4). Q8_0 weights in the repack buffer keep the fork's own repacked path.
+- Exact top-k fast path in `common_sampler` (also with penalties, DRY and a logit bias), and
+  MTP drafts of several requests padded to one length so they verify in one pass (rayakame).
 - `-mllvm -amdgpu-sched-strategy=max-ilp` compiler flag recommended at build time (see below)
 
 ## Now upstream (dropped from this fork)
@@ -88,6 +95,10 @@ no rebuild. Defaults are what a plain launch gets.
 | `GGML_CUDA_NO_ADD_NORM_FUSION=1` | off | residual ADD -> RMS_NORM -> MUL fusion off |
 | `GGML_CUDA_NO_GDN_GATE_FUSION=1` | off | GDN gate ADD -> SOFTPLUS -> MUL (+ SIGMOID) fusion off |
 | `GGML_CUDA_NO_GDN_L2_NORM_PAIR_FUSION=1` | off | GDN q/k l2 norms in one launch off |
+| `GGML_MMVQ_GCN_MC=0` | on | rayakame's 2..8 column row-group mat-vec off. `_MC_Q4K`, `_MC_Q8`, `_MC_Q2K`, `_MC_Q3K`, `_MC_IQ2S`, `_MC_IQ3XXS`, `_MC_IQ3S`, `_MC_IQ4NL`, `_MC_IQ4XS` `=0` turn off one type; `_MC_LDS=0` keeps Q5_K/Q6_K activations out of LDS; `_MC_GROUPS`, `_MC_WARPS`, `_MC_WPE` set the shape |
+| `GGML_MMVQ_GCN_TABLE=0` | on | the per-type mat-vec/MMQ column limit on GCN off. `GGML_MMVQ_GCN_MAX=n` or `GGML_MMVQ_GCN_MAX_<TYPE>=n` set the limit, `GGML_MMVQ_GCN_ROWS` (8192) the row count that splits the table |
+| `LLAMA_SAMPLER_SPARSE_TOPK=0` | on | exact top-k fast path in the common sampler off |
+| `LLAMA_ARG_SPEC_DRAFT_P_MIN_PAD=n` | 3 | from n drafting requests on, an MTP draft below p-min is padded to the longest confident one so all verify in one pass; 0 = off |
 | `GGML_CUDA_FEWROW_F32=0/512/1024` | 1 (auto) | few-row F32 mat-vec on GCN: off, or a forced block size |
 | `GGML_GDN_NO_COLTHREAD=1` | off | skip mx's column-thread GDN kernel; the chunked kernel and its gfx906 tuning run instead |
 | `GGML_CUDA_GDN_DECODE_MC=1` | off | GDN decode multi-column layout (measured slower; only reached with `GGML_GDN_NO_COLTHREAD=1`) |
@@ -108,8 +119,8 @@ no rebuild. Defaults are what a plain launch gets.
 | `GGML_CUDA_RP_NC_SPLIT=0` | on | repacked dense mat-vec: 9..16 tokens go to the tiled GEMM again instead of two narrow passes |
 | `-lm dio-auto` | off (`-lm dio`) | direct I/O, but chunks already in the page cache are read buffered from RAM; checked per chunk with `preadv2(RWF_NOWAIT)`. Linux only, elsewhere it is `-lm none` |
 | `LLAMA_DIO_AUTO_FILL=0/1` | auto | `-lm dio-auto` cache misses: 1 = read buffered so the next load is from RAM, 0 = read with O_DIRECT (no cache fill). Auto fills when the file fits in MemAvailable with 1/8 spare |
-| `GGML_FA_TILE_GFX906=0` | on | tile FA head 256, 2 heads per block: rayakame's MI50 rows for 1..8 tokens (128 threads, nbatch_K 32); used for 1 token always and for 2..8 tokens from 1024 K/V rows on. Off = the GCN table |
-| `GGML_FA_KV_PREFETCH=0` or a mask | all (2,4,8,16,32) | tile FA head 256: load the next K/V chunk into registers while the current one is computed; bit-identical. The value is a bit mask of the column counts that prefetch; 1 token from 32K K/V rows on never prefetches |
+| `GGML_FA_TILE_GFX906=0` | on | tile FA head 256, 2 Q heads per block: rayakame's MI50 rows for 1..8 tokens (128 threads, nbatch_K 32); used for 1 token always and for 2..8 tokens from 1024 K/V rows on. Off = the GCN table. 2 heads per block means GQA 2 (or 10, 14, ...); GQA 6 gets there only with `GGML_CUDA_FA_GQA_PAD=0`, since by default 1..8 tokens of GQA 3 and 5..7 are padded to 4/8 heads per block. Quantized K/V at 1..2 tokens use the vec kernel instead |
+| `GGML_FA_KV_PREFETCH=0` or a mask | all (2,4,8,16,32) | tile FA head 256, 2 Q heads per block (same GQA limits as above; GQA 6 from 9 tokens on uses it with the 32-column GCN row): load the next K/V chunk into registers while the current one is computed. Same math; results can differ in the last bits where a variant's occupancy changes the number of parallel blocks. The value is a bit mask of the column counts that prefetch; 1 token from 32K K/V rows on never prefetches |
 | `GGML_HIP_GRAPH_REINSTANTIATE=1` | off | re-instantiate HIP graphs instead of `hipGraphExecUpdate`, which leaks ~1 MiB per request on ROCm (issue 10713) |
 
 Build-time A/B options (not on by default until measured on MI50; Docker: `GFX906_HIP_FLAGS` / `GFX906_HIP_MAX_ILP` in `.env`):
@@ -119,6 +130,12 @@ Build-time A/B options (not on by default until measured on MI50; Docker: `GFX90
 | `-DGGML_HIP_FA_VEC_MIN_BLOCKS=2` or `4` | 1 | FA vec kernel occupancy (llama-of-vega measured 4 faster; with ROCm 6.4 clang this fork's q8_0/turbo vec kernels then spill 200-1100 bytes per lane) |
 | `-DGGML_HIP_DPP_REDUCE=1` | off | warp sums with DPP/swizzle instead of LDS shuffles (upstream PR #32215, +5% tg on MI100; not bit-identical) |
 | `-DGGML_HIP_MAX_ILP=ON` | OFF | max-ilp per file except `mmvq.cu`; drop the global `-amdgpu-sched-strategy=max-ilp` from the HIP flags then |
+
+Checking the FA tile rows and K/V prefetch on MI50: `scripts/gfx906-fa-prefetch-ab.sh` builds
+`build-fa-ab` with tests, reports VGPR spills of the head-256 tile kernels, runs test-backend-ops
+FLASH_ATTN_EXT against the CPU and times the head-256 cases with the switches above off and on
+(including `GGML_CUDA_FA_GQA_PAD=0`), and runs llama-bench when `MODEL` is set. Results go to
+`fa-ab-<date>/summary.md`. `DEVICES="0 1"` runs each card.
 
 ## Build
 

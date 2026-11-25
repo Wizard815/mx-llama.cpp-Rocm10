@@ -112,7 +112,14 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
 #define VDR_Q2_0_Q8_1_MMQ  2  // Q2_0 group 64: 128 bits (4 ints) per block, 2 32-element chunks
 
+#ifndef VDR_Q4_0_Q8_1_MMVQ
+#ifdef GGML_USE_HIP
+// gfx906 decodes ~11 % faster when each thread reads a whole block.
+#define VDR_Q4_0_Q8_1_MMVQ 4
+#else
 #define VDR_Q4_0_Q8_1_MMVQ 2
+#endif
+#endif
 #define VDR_Q4_0_Q8_1_MMQ  4
 
 template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_impl(
@@ -136,7 +143,14 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_imp
     return d4 * (sumi * ds8f.x - (8*vdr/QI4_0) * ds8f.y);
 }
 
+#ifndef VDR_Q4_1_Q8_1_MMVQ
+#ifdef GGML_USE_HIP
+// gfx906 decodes ~11 % faster when each thread reads a whole block.
+#define VDR_Q4_1_Q8_1_MMVQ 4
+#else
 #define VDR_Q4_1_Q8_1_MMVQ 2
+#endif
+#endif
 #define VDR_Q4_1_Q8_1_MMQ  4
 
 template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_impl(

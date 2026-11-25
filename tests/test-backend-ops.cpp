@@ -6250,6 +6250,36 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// Quantizing a big matrix on the CPU takes longer than timing it: 64 random rows, repeated
+struct test_mul_mat_big : public test_mul_mat {
+    test_mul_mat_big(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->ne[1] < 4096 || !ggml_is_quantized(t->type)) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            const int64_t nr = 64;
+            std::vector<float> f(t->ne[0]*nr);
+            std::default_random_engine gen(42);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            for (float & x : f) {
+                x = dist(gen);
+            }
+            const size_t row = ggml_row_size(t->type, t->ne[0]);
+            std::vector<uint8_t> q(row*nr);
+            ggml_quantize_chunk(t->type, f.data(), q.data(), 0, nr, t->ne[0], nullptr);
+            std::vector<uint8_t> all(ggml_nbytes(t));
+            for (size_t off = 0; off < all.size(); off += q.size()) {
+                memcpy(all.data() + off, q.data(), std::min(q.size(), all.size() - off));
+            }
+            ggml_backend_tensor_set(t, all.data(), 0, all.size());
+        }
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -9963,6 +9993,35 @@ struct test_flash_attn_ext_mask_bcast : public test_flash_attn_ext {
     }
 };
 
+// per-sequence causal mask that hides the K/V tail, so the mask scan gives each Q tile its own KV_max below ne11
+// (multiple sequences turn the scan on for any batch size)
+struct test_flash_attn_ext_kv_max : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",mask=causal_seq";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * t = ggml_get_tensor(ctx, "m");
+        GGML_ASSERT(t != nullptr && t->ne[2] == 1);
+        std::vector<ggml_fp16_t> data(ggml_nelements(t));
+        for (int64_t b = 0; b < t->ne[3]; ++b) {
+            // sequence b sees kv/2 + b*kv/4 rows before its first query, minus a few so the end is not tile aligned
+            const int64_t n_past = std::max<int64_t>(1, kv/2 + b*(kv/4) - 37*(b + 1) - t->ne[1]);
+            for (int64_t q = 0; q < t->ne[1]; ++q) {
+                for (int64_t k = 0; k < t->ne[0]; ++k) {
+                    const int64_t i = (b*t->ne[1] + q)*t->ne[0] + k;
+                    const float bias = 0.125f*((k + 3*q + 7*b) % 17 - 8);
+                    data[i] = ggml_fp32_to_fp16(k <= n_past + q ? bias : -INFINITY);
+                }
+            }
+        }
+        ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT with kv_rows: each q slice attends to its own list of K/V cache rows
 struct test_flash_attn_ext_kv_rows : public test_case {
     const int64_t hs;
@@ -12997,6 +13056,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // GCN row-group mat-vec of Q5_K/Q6_K: row tails, an odd superblock count, the Qwen3.8 27B K = 6144
+    for (int n = 2; n <= 8; ++n) {
+        for (ggml_type type_a : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{1021, 4096}, {4099, 4096}, {1021, 17*256}, {5123, 6144}}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
@@ -14156,6 +14224,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // gfx906 FA tile rows and K/V register prefetch (head 256, 2 Q heads per block): GQA 2, and GQA 6 from 9 tokens on
+    // (1..8 tokens of GQA 6 are padded to 8 heads per block unless GGML_CUDA_FA_GQA_PAD=0). The rows switch at 1024 K/V
+    // rows, the prefetch is off for 1 token from 32768 rows. scripts/gfx906-fa-prefetch-ab.sh runs these per env setting.
+    for (int nr2 : { 2, 6, }) {
+        for (int kv : { 512, 1024, 4096, }) {
+            for (int nb : { 1, 2, 3, 4, 5, 8, 9, 16, 17, 33, }) {
+                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                }
+            }
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {nr2, 1}, kv, 4, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {nr2, 1}, kv, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+        }
+        for (int nb : { 1, 2, 4, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {nr2, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+        for (int nb : { 1, 4, 9, 33, }) {
+            test_cases.emplace_back(new test_flash_attn_ext_kv_max(256, 256, 2, {nr2, 3}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
@@ -15152,6 +15241,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 14336, n, 4096, {1, 1}, {1, 1}));
     }
 
+    // Qwen3.8 27B layer matrices (m x k): attn_k/v, attn_gate, attn_qkv, attn_q, ffn_gate/up, attn_output and ssm_out, ffn_down
+    for (ggml_type type_a : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{1024, 5120}, {6144, 5120}, {10240, 5120}, {12288, 5120},
+                                                                  {17408, 5120}, {5120, 6144}, {5120, 17408}}) {
+            for (int64_t n = 2; n <= 8; ++n) {
+                test_cases.emplace_back(new test_mul_mat_big(type_a, m, n, k));
+            }
+        }
+    }
+
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
@@ -15205,6 +15304,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     // Same non-causal vision-encoder shape for the other head size padded in-kernel by the CUDA MMA kernels
     test_cases.emplace_back(new test_flash_attn_ext(40, 40, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // gfx906 FA tile rows and K/V prefetch: head 256, 2 K/V heads, GQA 2 and 6, decode and short batches across depths.
+    // scripts/gfx906-fa-prefetch-ab.sh times these with the prefetch, the rows and the GQA padding switched on and off.
+    for (int nr2 : {2, 6}) {
+        for (int64_t kv : {512, 1024, 4096, 16384, 32768}) {
+            for (int nb : {1, 2, 4, 8, 16}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+                if (nb >= 4) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+                }
+            }
+        }
+    }
 
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.
