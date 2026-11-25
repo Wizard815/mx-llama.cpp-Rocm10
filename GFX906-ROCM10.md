@@ -104,7 +104,18 @@ no rebuild. Defaults are what a plain launch gets.
 | `LLAMA_MTP_DRAFT_VOCAB=K` | off | MTP draft scores only the first K token ids (layer split) |
 | `LLAMA_MOE_RANDOM_ROUTING=1` | off | benchmark only: random expert choice, for MoE cache tests |
 | `LLAMA_LOAD_BUFFER_MB=N` | 64 | read chunk for `-lm none` loads (was 1 MB); `-lm none` reloads from the page cache after a swap, `dio` always reads the disk |
+| `GGML_CUDA_FA_GQA_PAD=0` | on | tile FA: no padding of GQA groups 3 and 5..7 to 4/8 heads per block (1..8 tokens) |
+| `GGML_CUDA_RP_NC_SPLIT=0` | on | repacked dense mat-vec: 9..16 tokens go to the tiled GEMM again instead of two narrow passes |
 | `GGML_HIP_GRAPH_REINSTANTIATE=1` | off | re-instantiate HIP graphs instead of `hipGraphExecUpdate`, which leaks ~1 MiB per request on ROCm (issue 10713) |
+
+Build-time A/B options (not on by default until measured on MI50; Docker: `GFX906_HIP_FLAGS` / `GFX906_HIP_MAX_ILP` in `.env`):
+
+| Build option | Default | Effect |
+|---|---|---|
+| `-DGGML_HIP_FA_VEC_MIN_BLOCKS=2` or `4` | 1 | FA vec kernel occupancy (llama-of-vega measured 4 faster; with ROCm 6.4 clang this fork's q8_0/turbo vec kernels then spill 200-1100 bytes per lane) |
+| `-DGGML_FATTN_TILE_GCN_RAYAKAME` | off | rayakame's MI50 tile FA rows for head 256 at 1..8 tokens (faster from 1024 K/V rows, slower below) |
+| `-DGGML_HIP_DPP_REDUCE=1` | off | warp sums with DPP/swizzle instead of LDS shuffles (upstream PR #32215, +5% tg on MI100; not bit-identical) |
+| `-DGGML_HIP_MAX_ILP=ON` | OFF | max-ilp per file except `mmvq.cu`; drop the global `-amdgpu-sched-strategy=max-ilp` from the HIP flags then |
 
 ## Build
 
