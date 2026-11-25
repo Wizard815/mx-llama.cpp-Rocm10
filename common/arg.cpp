@@ -2683,7 +2683,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)\n"
         "- mlock: force system to keep model in RAM rather than swapping or compressing\n"
         "- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
-        "- dio: use DirectIO if available\n",
+        "- dio: use DirectIO if available\n"
+        "- dio-auto: like dio, but read the parts of the file already in the page cache with buffered I/O (Linux; LLAMA_DIO_AUTO_FILL=0/1 controls if misses fill the cache)\n",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "auto")       { params.load_mode = LLAMA_LOAD_MODE_AUTO;       }
             else if (value == "none")       { params.load_mode = LLAMA_LOAD_MODE_NONE;       }
@@ -2691,6 +2692,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             else if (value == "mlock")      { params.load_mode = LLAMA_LOAD_MODE_MLOCK;      }
             else if (value == "mmap+mlock") { params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK; }
             else if (value == "dio")        { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;  }
+            else if (value == "dio-auto")   { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO_AUTO; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));

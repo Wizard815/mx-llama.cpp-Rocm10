@@ -18,7 +18,8 @@ using llama_mmaps  = std::vector<std::unique_ptr<llama_mmap>>;
 using llama_mlocks = std::vector<std::unique_ptr<llama_mlock>>;
 
 struct llama_file {
-    llama_file(const char * fname, const char * mode, bool use_direct_io = false);
+    // direct_io_auto: read page cache hits buffered and misses with direct I/O (Linux only)
+    llama_file(const char * fname, const char * mode, bool use_direct_io = false, bool direct_io_auto = false);
     llama_file(FILE * file);
     ~llama_file();
 

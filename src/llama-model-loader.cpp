@@ -563,7 +563,8 @@ llama_model_loader::llama_model_loader(
     tensor_buft_overrides = param_tensor_buft_overrides_p;
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
-    this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+    this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO || load_mode == LLAMA_LOAD_MODE_DIRECT_IO_AUTO;
+    this->use_direct_io_auto = load_mode == LLAMA_LOAD_MODE_DIRECT_IO_AUTO;
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -582,7 +583,7 @@ llama_model_loader::llama_model_loader(
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
-        files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io, use_direct_io_auto));
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -712,7 +713,7 @@ llama_model_loader::llama_model_loader(
                     numbered ? " (declared split numbering ignored)" : "");
             }
 
-            files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+            files.emplace_back(new llama_file(fname_split, "rb", use_direct_io, use_direct_io_auto));
             contexts.emplace_back(std::move(ctx_ptr));
             if (idx < n_backbone) {
                 n_backbone_files = files.size();

@@ -19,6 +19,11 @@
 #include <malloc.h>
 #endif
 
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 static constexpr size_t test_file_size = LLAMA_DIRECT_IO_BUFFER_SIZE + 3*1024*1024 + 1;
 static constexpr size_t test_io_size   = 1024*1024;
 
@@ -108,8 +113,8 @@ static void write_test_file(const std::filesystem::path & path) {
     }
 }
 
-static void check_file(testing & t, const std::filesystem::path & path, bool use_direct_io) {
-    llama_file file(path.string().c_str(), "rb", use_direct_io);
+static void check_file(testing & t, const std::filesystem::path & path, bool use_direct_io, bool direct_io_auto = false) {
+    llama_file file(path.string().c_str(), "rb", use_direct_io, direct_io_auto);
     if (use_direct_io && !file.has_direct_io()) {
         t.skip("direct I/O is unavailable for the test file");
         return;
@@ -201,6 +206,47 @@ static void check_direct_io_fallback(testing & t, const std::filesystem::path & 
     t.assert_equal(offset + 2 * alignment, file.tell());
 }
 
+#if defined(__linux__)
+// drop every other 1 MiB + 4 KiB block of the file from the page cache, or all of it
+static void evict_from_page_cache(const std::filesystem::path & path, bool all) {
+    const int fd = open(path.string().c_str(), O_RDONLY);
+    if (fd == -1) {
+        return;
+    }
+    fdatasync(fd); // dirty pages are not dropped
+    if (all) {
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    } else {
+        const size_t block = 1024*1024 + 4096;
+        for (size_t offset = 0; offset < test_file_size; offset += 2*block) {
+            posix_fadvise(fd, (off_t) offset, (off_t) block, POSIX_FADV_DONTNEED);
+        }
+    }
+    close(fd);
+}
+
+static void check_direct_io_auto(testing & t, const std::filesystem::path & path) {
+    const char * fill_env = getenv("LLAMA_DIO_AUTO_FILL");
+    const std::string fill_old = fill_env ? fill_env : "";
+
+    setenv("LLAMA_DIO_AUTO_FILL", "0", 1);
+    t.test("cached", [&] (testing & t) { check_file(t, path, true, true); });
+    evict_from_page_cache(path, false);
+    t.test("partly_cached", [&] (testing & t) { check_file(t, path, true, true); });
+    evict_from_page_cache(path, true);
+    t.test("uncached", [&] (testing & t) { check_file(t, path, true, true); });
+    evict_from_page_cache(path, true);
+    setenv("LLAMA_DIO_AUTO_FILL", "1", 1);
+    t.test("uncached_fill", [&] (testing & t) { check_file(t, path, true, true); });
+
+    if (fill_env) {
+        setenv("LLAMA_DIO_AUTO_FILL", fill_old.c_str(), 1);
+    } else {
+        unsetenv("LLAMA_DIO_AUTO_FILL");
+    }
+}
+#endif
+
 static void check_mmap(testing & t, const std::filesystem::path & path) {
     if (!llama_mmap::SUPPORTED) {
         return;
@@ -227,6 +273,9 @@ int main() {
     t.test("llama_file.buffered", [&] (testing & t) { check_file(t, test_file.path, false); });
     t.test("llama_file.direct", [&] (testing & t) { check_file(t, test_file.path, true); });
     t.test("llama_file.direct_fallback", [&] (testing & t) { check_direct_io_fallback(t, test_file.path); });
+#if defined(__linux__)
+    t.test("llama_file.direct_auto", [&] (testing & t) { check_direct_io_auto(t, test_file.path); });
+#endif
     t.test("llama_mmap", [&] (testing & t) { check_mmap(t, test_file.path); });
     return t.summary();
 }

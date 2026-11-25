@@ -206,12 +206,13 @@ extern "C" {
     };
 
     enum llama_load_mode {
-        LLAMA_LOAD_MODE_AUTO       = -1, // auto-detect based on device capabilities
-        LLAMA_LOAD_MODE_NONE       =  0, // no special loading mode
-        LLAMA_LOAD_MODE_MMAP       =  1, // memory map the model
-        LLAMA_LOAD_MODE_MLOCK      =  2, // force system to keep model in RAM rather than swapping or compressing
-        LLAMA_LOAD_MODE_MMAP_MLOCK =  3, // mmap + force system to keep model in RAM rather than swapping or compressing
-        LLAMA_LOAD_MODE_DIRECT_IO  =  4, // use direct I/O if available
+        LLAMA_LOAD_MODE_AUTO           = -1, // auto-detect based on device capabilities
+        LLAMA_LOAD_MODE_NONE           =  0, // no special loading mode
+        LLAMA_LOAD_MODE_MMAP           =  1, // memory map the model
+        LLAMA_LOAD_MODE_MLOCK          =  2, // force system to keep model in RAM rather than swapping or compressing
+        LLAMA_LOAD_MODE_MMAP_MLOCK     =  3, // mmap + force system to keep model in RAM rather than swapping or compressing
+        LLAMA_LOAD_MODE_DIRECT_IO      =  4, // use direct I/O if available
+        LLAMA_LOAD_MODE_DIRECT_IO_AUTO =  5, // direct I/O, but read the parts of the file that are in the page cache buffered (Linux)
     };
 
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);

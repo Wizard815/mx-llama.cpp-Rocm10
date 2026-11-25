@@ -106,6 +106,8 @@ no rebuild. Defaults are what a plain launch gets.
 | `LLAMA_LOAD_BUFFER_MB=N` | 64 | read chunk for `-lm none` loads (was 1 MB); `-lm none` reloads from the page cache after a swap, `dio` always reads the disk |
 | `GGML_CUDA_FA_GQA_PAD=0` | on | tile FA: no padding of GQA groups 3 and 5..7 to 4/8 heads per block (1..8 tokens) |
 | `GGML_CUDA_RP_NC_SPLIT=0` | on | repacked dense mat-vec: 9..16 tokens go to the tiled GEMM again instead of two narrow passes |
+| `-lm dio-auto` | off (`-lm dio`) | direct I/O, but chunks already in the page cache are read buffered from RAM; checked per chunk with `preadv2(RWF_NOWAIT)`. Linux only, elsewhere it is `-lm none` |
+| `LLAMA_DIO_AUTO_FILL=0/1` | auto | `-lm dio-auto` cache misses: 1 = read buffered so the next load is from RAM, 0 = read with O_DIRECT (no cache fill). Auto fills when the file fits in MemAvailable with 1/8 spare |
 | `GGML_HIP_GRAPH_REINSTANTIATE=1` | off | re-instantiate HIP graphs instead of `hipGraphExecUpdate`, which leaks ~1 MiB per request on ROCm (issue 10713) |
 
 Build-time A/B options (not on by default until measured on MI50; Docker: `GFX906_HIP_FLAGS` / `GFX906_HIP_MAX_ILP` in `.env`):

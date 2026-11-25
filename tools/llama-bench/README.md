@@ -67,7 +67,7 @@ test parameters:
   -nkvo, --no-kv-offload <0|1>              (default: 0)
   -fa, --flash-attn <on|off|auto>           (default: auto)
   -dev, --device <dev0/dev1/...>            (default: auto)
-  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio>
+  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio|dio-auto>
                                             (default: auto)
   -lzm, --lazy-mode <on|auto|off>           (default: auto)
   -embd, --embeddings <0|1>                 (default: 0)

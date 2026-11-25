@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <chrono>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -23,6 +24,11 @@
             #include <sys/resource.h>
         #endif
     #endif
+#endif
+
+#ifdef __linux__
+    #include <sys/uio.h>
+    #include <fstream>
 #endif
 
 #if defined(_WIN32)
@@ -92,9 +98,10 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode, const bool use_direct_io = false) : fname(fname) {
+    impl(const char * fname, const char * mode, const bool use_direct_io = false, const bool direct_io_auto = false) : fname(fname) {
         init_buffered_io(mode);
-        if (use_direct_io && std::strcmp(mode, "rb") == 0) {
+        // dio-auto needs RWF_NOWAIT, so it is the same as buffered I/O here
+        if (use_direct_io && !direct_io_auto && std::strcmp(mode, "rb") == 0) {
             DWORD error = ERROR_SUCCESS;
             if (!init_direct_io(error)) {
                 LLAMA_LOG_WARN("Failed to open file '%s' with unbuffered I/O: %s. Falling back to buffered I/O\n",
@@ -404,13 +411,16 @@ struct llama_file::impl {
     }
     std::string fname;
 #else
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
+    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false, [[maybe_unused]] const bool direct_io_auto = false) : fname(fname) {
 #ifdef __linux__
         // Try unbuffered I/O for read only
         if (use_direct_io && std::strcmp(mode, "rb") == 0) {
             if (init_fd()) {
                 LLAMA_LOG_INFO("%s: file '%s' opened with direct I/O (alignment: %zu bytes)\n",
                                __func__, fname, alignment);
+                if (direct_io_auto) {
+                    init_fd_cached();
+                }
                 return;
             }
             LLAMA_LOG_WARN("Failed to open file '%s' with unbuffered I/O: %s. Falling back to buffered I/O\n",
@@ -439,7 +449,141 @@ struct llama_file::impl {
         }
         return false;
     }
+
+    // dio-auto: a second, buffered fd reads the parts of the file that are in the page cache
+    void init_fd_cached() {
+        fd_cached = open(fname.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd_cached == -1) {
+            LLAMA_LOG_WARN("%s: dio-auto: failed to open '%s' buffered: %s, using direct I/O only\n",
+                           __func__, fname.c_str(), strerror(errno));
+            return;
+        }
+#ifndef RWF_NOWAIT
+        nowait_ok = false;
 #endif
+        LLAMA_LOG_INFO("%s: file '%s' uses dio-auto: page cache hits are read buffered, misses with direct I/O\n",
+                       __func__, fname.c_str());
+    }
+
+    static size_t mem_available() {
+        std::ifstream meminfo("/proc/meminfo");
+        std::string key;
+        size_t kb = 0;
+        while (meminfo >> key >> kb) {
+            if (key == "MemAvailable:") {
+                return kb * 1024;
+            }
+            meminfo.ignore(256, '\n');
+        }
+        return 0;
+    }
+
+    // fill the page cache on a miss when the whole file fits in free RAM, so the next load is from RAM
+    bool fill_cache() {
+        if (!nowait_ok) {
+            return true;
+        }
+        if (fill < 0) {
+            const char * env = getenv("LLAMA_DIO_AUTO_FILL");
+            const size_t avail = mem_available();
+            fill = env != nullptr ? atoi(env) != 0 : size + size / 8 <= avail;
+            LLAMA_LOG_INFO("%s: dio-auto: page cache misses are read %s (file %.2f GiB, MemAvailable %.2f GiB%s)\n",
+                           __func__, fill ? "buffered to fill the cache" : "with direct I/O",
+                           size / 1073741824.0, avail / 1073741824.0, env != nullptr ? ", set by LLAMA_DIO_AUTO_FILL" : "");
+        }
+        return fill;
+    }
+
+    // read the cached part of [tell(), tell() + len) with RWF_NOWAIT
+    // returns the number of bytes done; the rest must be read with direct I/O
+    size_t read_cached(void * ptr, size_t len, bool align_rest) {
+        const size_t offset = tell();
+        char * dst = reinterpret_cast<char *>(ptr);
+        size_t done = 0;
+
+        int64_t t0 = time_us();
+#ifdef RWF_NOWAIT
+        while (nowait_ok && done < len) {
+            // probe with one page first: a miss starts readahead, keep it small so direct I/O does not read the data twice
+            struct iovec iov = { dst + done, done == 0 ? std::min<size_t>(len, 4096) : len - done };
+            const ssize_t ret = preadv2(fd_cached, &iov, 1, (off_t) (offset + done), RWF_NOWAIT);
+            if (ret > 0) {
+                done += (size_t) ret;
+                continue;
+            }
+            if (ret == 0) {
+                break;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN) {
+                break;
+            }
+            if (errno == ENOSYS || errno == EOPNOTSUPP || errno == EINVAL) {
+                LLAMA_LOG_WARN("%s: dio-auto: RWF_NOWAIT reads not supported for '%s' (%s), using buffered I/O\n",
+                               __func__, fname.c_str(), strerror(errno));
+                nowait_ok = false;
+                break;
+            }
+            throw std::runtime_error(format("read error: %s", strerror(errno)));
+        }
+#endif
+        n_cached  += done;
+        us_cached += time_us() - t0;
+
+        if (done < len && offset + done < size && fill_cache()) {
+            t0 = time_us();
+            const size_t start = done;
+            while (done < len && offset + done < size) {
+                const ssize_t ret = pread(fd_cached, dst + done, len - done, (off_t) (offset + done));
+                if (ret == -1 && errno == EINTR) {
+                    continue;
+                }
+                if (ret == -1) {
+                    throw std::runtime_error(format("read error: %s", strerror(errno)));
+                }
+                if (ret == 0) {
+                    break;
+                }
+                done += (size_t) ret;
+            }
+            n_filled  += done - start;
+            us_filled += time_us() - t0;
+        }
+
+        if (done < len && offset + done >= size) {
+            // past EOF, like the direct I/O path
+            std::memset(dst + done, 0, len - done);
+            done = len;
+        }
+        if (done < len && align_rest) {
+            // keep the direct I/O part aligned, the overlap is read again
+            done &= ~(alignment - 1);
+        }
+        seek(std::min(offset + done, size), SEEK_SET);
+        return done;
+    }
+#endif
+
+    void close_fd_cached() {
+        if (fd_cached == -1) {
+            return;
+        }
+        close(fd_cached);
+        fd_cached = -1;
+        const double gib = 1073741824.0;
+        auto rate = [gib](size_t n, int64_t us) { return us > 0 ? n / gib / (us / 1e6) : 0.0; };
+        LLAMA_LOG_INFO("%s: dio-auto '%s': %.2f GiB from page cache (%.2f GiB/s), %.2f GiB buffered from disk (%.2f GiB/s), %.2f GiB direct from disk (%.2f GiB/s)\n",
+                       __func__, fname.c_str(),
+                       n_cached / gib, rate(n_cached, us_cached),
+                       n_filled / gib, rate(n_filled, us_filled),
+                       n_direct / gib, rate(n_direct, us_direct));
+    }
+
+    static int64_t time_us() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
 
     void init_fp(const char * mode) {
         fp = ggml_fopen(fname.c_str(), mode);
@@ -504,6 +648,18 @@ struct llama_file::impl {
                 throw std::runtime_error("unexpectedly reached end of file");
             }
         } else {
+            int64_t t0 = 0;
+#ifdef __linux__
+            if (fd_cached != -1) {
+                const size_t done = read_cached(ptr, len, true);
+                if (done == len) {
+                    return;
+                }
+                ptr = reinterpret_cast<char *>(ptr) + done;
+                len -= done;
+                t0 = time_us();
+            }
+#endif
             size_t bytes_read = 0;
             while (bytes_read < len) {
                 const size_t to_read = len - bytes_read;
@@ -517,6 +673,7 @@ struct llama_file::impl {
                         LLAMA_LOG_WARN("%s: file '%s' falling back to buffered I/O due to %s\n",
                                        __func__, fname.c_str(), strerror(errno));
                         const size_t read_offset = tell();
+                        close_fd_cached();
                         close(fd);
                         fd = -1;
                         alignment = 1;
@@ -531,12 +688,16 @@ struct llama_file::impl {
                     off_t pos = lseek(fd, 0, SEEK_CUR);
                     if (pos != -1 && (size_t) pos == size) {
                         std::memset(reinterpret_cast<char *>(ptr) + bytes_read, 0, len - bytes_read);
-                        return;
+                        break;
                     }
                     throw std::runtime_error("unexpectedly reached end of file");
                 }
 
                 bytes_read += (size_t) ret;
+            }
+            if (fd_cached != -1) {
+                n_direct  += len;
+                us_direct += time_us() - t0;
             }
         }
     }
@@ -555,6 +716,7 @@ struct llama_file::impl {
         if (ret != 0) {
             LLAMA_LOG_WARN("%s: file '%s' falling back to buffered I/O due to %s\n",
                            __func__, fname.c_str(), strerror(ret));
+            close_fd_cached();
             close(fd);
             fd = -1;
             alignment = 1;
@@ -590,6 +752,17 @@ struct llama_file::impl {
 
     void read_raw(void * ptr, size_t len) {
         if (has_direct_io()) {
+#ifdef __linux__
+            if (fd_cached != -1) {
+                // cached data goes to ptr directly, without the aligned bounce buffer
+                const size_t done = read_cached(ptr, len, false);
+                ptr = reinterpret_cast<char *>(ptr) + done;
+                len -= done;
+                if (len == 0) {
+                    return;
+                }
+            }
+#endif
             read_aligned_chunk(ptr, len);
         } else {
             read_raw_unsafe(ptr, len);
@@ -622,6 +795,7 @@ struct llama_file::impl {
     }
 
     ~impl() {
+        close_fd_cached();
         if (fd != -1) {
             close(fd);
         } else if (fp && owns_fp) {
@@ -630,6 +804,13 @@ struct llama_file::impl {
     }
     int fd = -1;
     std::string fname;
+
+    // dio-auto state
+    int fd_cached  = -1;
+    int fill       = -1; // -1 = not decided yet
+    bool nowait_ok = true;
+    size_t  n_cached  = 0, n_filled  = 0, n_direct  = 0;
+    int64_t us_cached = 0, us_filled = 0, us_direct = 0;
 #endif
 
     size_t read_alignment() const {
@@ -643,8 +824,8 @@ struct llama_file::impl {
     bool owns_fp = true;
 };
 
-llama_file::llama_file(const char * fname, const char * mode, const bool use_direct_io) :
-    pimpl(std::make_unique<impl>(fname, mode, use_direct_io)) {}
+llama_file::llama_file(const char * fname, const char * mode, const bool use_direct_io, const bool direct_io_auto) :
+    pimpl(std::make_unique<impl>(fname, mode, use_direct_io, direct_io_auto)) {}
 
 llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
 

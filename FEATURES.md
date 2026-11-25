@@ -39,7 +39,11 @@ On a trimmed ROCm runtime (such as the slim Docker image) also set
 ROCm install detects it automatically and does not need this.
 
 Always pass `-lm dio` (`--load-mode dio`). mmap on the model file hangs on this
-stack. The older `--no-mmap` / `-dio` spellings still parse but are deprecated
+stack. With a model swapper use `-lm dio-auto`: it reads the parts of the file
+that are in the page cache from RAM and the rest with direct I/O, and by default
+fills the cache on a miss when the file fits in free RAM, so a reload after a
+swap does not read the disk again (`LLAMA_DIO_AUTO_FILL=0` keeps misses out of
+the cache, `=1` always fills). The older `--no-mmap` / `-dio` spellings still parse but are deprecated
 upstream, and in `llama-bench` they append two separate load modes, so the old
 two-flag form runs every benchmark twice. Select GPUs with `HIP_VISIBLE_DEVICES`
 (AMD) or `CUDA_VISIBLE_DEVICES` (NVIDIA); the example commands below use the AMD
