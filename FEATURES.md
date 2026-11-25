@@ -31,7 +31,7 @@ Recommended environment (each variable enables one of the features above):
 ```bash
 export HSA_FORCE_FINE_GRAIN_PCIE=1  # peer-write AllReduce fast path (AMD over PCIe, validated gfx906)
 export GPU_MAX_HW_QUEUES=8          # MoE throughput on -tps
-export LLAMA_ENABLE_MTP_OPT=1       # MTP optimizations (with --spec-type draft-mtp)
+# MTP optimizations are on by default with --spec-type draft-mtp (switches in GFX906-ROCM10.md)
 ```
 
 On a trimmed ROCm runtime (such as the slim Docker image) also set
@@ -93,11 +93,11 @@ and `GGML_TP_AR_TWOSHOT_MIN_NE` sets the crossover in elements. Validated on gfx
 
 ## MTP speculative-decode optimizations
 
-Opt-in optimizations on top of upstream's `--spec-type draft-mtp` (MTP and the
-Qwen3.6 head are upstream), enabled with `LLAMA_ENABLE_MTP_OPT=1`: deferred-prefill
-KV staging, a KV-only prefill replay, disabling the draft context's pipeline ring,
-and a non-finite-draft fail-safe. Default off uses the standard `draft-mtp` path
-with these disabled. Backend-generic.
+On top of upstream's `--spec-type draft-mtp` (MTP and the Qwen3.6 head are upstream), on by
+default: deferred-prefill KV staging (`LLAMA_MTP_DEFERRED_PREFILL=0` turns it off), a KV-only
+prefill replay (`LLAMA_MTP_NO_KV_ONLY=1`), no pipeline ring for the draft context
+(`LLAMA_MTP_DRAFT_PIPELINE=1` brings it back), and a non-finite-draft fail-safe.
+`LLAMA_ENABLE_MTP_OPT` is no longer read. Backend-generic.
 
 ## Recurrent state rollback (snapshot ring)
 

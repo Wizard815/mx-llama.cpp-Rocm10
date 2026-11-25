@@ -77,6 +77,33 @@ Flash-attention on gfx906 already uses the native `v_dot2_f32_f16` instruction u
 (`common.cuh`'s `V_DOT2_F32_F16_AVAILABLE` gate includes `__gfx906__`) - no separate port
 needed there.
 
+## Runtime switches
+
+Every fork feature that changes speed has an environment switch, so an A/B needs
+no rebuild. Defaults are what a plain launch gets.
+
+| Switch | Default | Effect |
+|---|---|---|
+| `GGML_CUDA_DISABLE_FUSION=1` | off | all CUDA/HIP graph fusions off (upstream switch) |
+| `GGML_CUDA_NO_ADD_NORM_FUSION=1` | off | residual ADD -> RMS_NORM -> MUL fusion off |
+| `GGML_CUDA_NO_GDN_GATE_FUSION=1` | off | GDN gate ADD -> SOFTPLUS -> MUL (+ SIGMOID) fusion off |
+| `GGML_CUDA_NO_GDN_L2_NORM_PAIR_FUSION=1` | off | GDN q/k l2 norms in one launch off |
+| `GGML_CUDA_FEWROW_F32=0/512/1024` | 1 (auto) | few-row F32 mat-vec on GCN: off, or a forced block size |
+| `GGML_GDN_NO_COLTHREAD=1` | off | skip mx's column-thread GDN kernel; the chunked kernel and its gfx906 tuning run instead |
+| `GGML_CUDA_GDN_DECODE_MC=1` | off | GDN decode multi-column layout (measured slower; only reached with `GGML_GDN_NO_COLTHREAD=1`) |
+| `GGML_CUDA_REPACK_MOE_OPT=0/1` | 1 | LDS skew in the repacked Q8_0 MoE GEMM |
+| `--no-repack` | repack on | plain weight layout, no gfx906 repacked GEMM (the mixa Q5_K MMQ tile only matters then) |
+| `GGML_CUDA_MMQ_GCN_STREAM_K=0` | on | GCN MMQ without stream-k (as before upstream #30022) |
+| `GGML_ENABLE_CUSTOM_AR=0` | on | tensor-split custom P2P AllReduce off |
+| `GGML_TP_AR_BF16_MIN_NE=N` | 0 (off) | AllReduce messages of N+ elements travel as BF16 |
+| `GGML_SCHED_BARRIER_ALWAYS=1` | off | the scheduler waits before every split again (old behaviour) |
+| `LLAMA_MTP_DEFERRED_PREFILL=0` | on | MTP: build the draft KV per prompt chunk instead of once after prefill |
+| `LLAMA_MTP_NO_KV_ONLY=1` | off | MTP: the prefill replay runs the full draft head |
+| `LLAMA_MTP_DRAFT_PIPELINE=1` | off | MTP: give the draft context a pipeline ring |
+| `LLAMA_MTP_TENSOR_MIRROR=1` | off | MTP under `-sm tensor`: mirror the output head so the GPU sampler can run |
+| `LLAMA_MTP_DRAFT_VOCAB=K` | off | MTP draft scores only the first K token ids (layer split) |
+| `LLAMA_MOE_RANDOM_ROUTING=1` | off | benchmark only: random expert choice, for MoE cache tests |
+
 ## Build
 
 Requires a gfx906 ROCm 10 install from
