@@ -108,6 +108,8 @@ no rebuild. Defaults are what a plain launch gets.
 | `GGML_CUDA_RP_NC_SPLIT=0` | on | repacked dense mat-vec: 9..16 tokens go to the tiled GEMM again instead of two narrow passes |
 | `-lm dio-auto` | off (`-lm dio`) | direct I/O, but chunks already in the page cache are read buffered from RAM; checked per chunk with `preadv2(RWF_NOWAIT)`. Linux only, elsewhere it is `-lm none` |
 | `LLAMA_DIO_AUTO_FILL=0/1` | auto | `-lm dio-auto` cache misses: 1 = read buffered so the next load is from RAM, 0 = read with O_DIRECT (no cache fill). Auto fills when the file fits in MemAvailable with 1/8 spare |
+| `GGML_FA_TILE_GFX906=0` | on | tile FA head 256, 2 heads per block: rayakame's MI50 rows for 1..8 tokens (128 threads, nbatch_K 32); used for 1 token always and for 2..8 tokens from 1024 K/V rows on. Off = the GCN table |
+| `GGML_FA_KV_PREFETCH=0` or a mask | all (2,4,8,16,32) | tile FA head 256: load the next K/V chunk into registers while the current one is computed; bit-identical. The value is a bit mask of the column counts that prefetch; 1 token from 32K K/V rows on never prefetches |
 | `GGML_HIP_GRAPH_REINSTANTIATE=1` | off | re-instantiate HIP graphs instead of `hipGraphExecUpdate`, which leaks ~1 MiB per request on ROCm (issue 10713) |
 
 Build-time A/B options (not on by default until measured on MI50; Docker: `GFX906_HIP_FLAGS` / `GFX906_HIP_MAX_ILP` in `.env`):
@@ -115,7 +117,6 @@ Build-time A/B options (not on by default until measured on MI50; Docker: `GFX90
 | Build option | Default | Effect |
 |---|---|---|
 | `-DGGML_HIP_FA_VEC_MIN_BLOCKS=2` or `4` | 1 | FA vec kernel occupancy (llama-of-vega measured 4 faster; with ROCm 6.4 clang this fork's q8_0/turbo vec kernels then spill 200-1100 bytes per lane) |
-| `-DGGML_FATTN_TILE_GCN_RAYAKAME` | off | rayakame's MI50 tile FA rows for head 256 at 1..8 tokens (faster from 1024 K/V rows, slower below) |
 | `-DGGML_HIP_DPP_REDUCE=1` | off | warp sums with DPP/swizzle instead of LDS shuffles (upstream PR #32215, +5% tg on MI100; not bit-identical) |
 | `-DGGML_HIP_MAX_ILP=ON` | OFF | max-ilp per file except `mmvq.cu`; drop the global `-amdgpu-sched-strategy=max-ilp` from the HIP flags then |
 
