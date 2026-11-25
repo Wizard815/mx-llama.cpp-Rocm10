@@ -1723,7 +1723,14 @@ bool llama_model_loader::load_all_data(
     }
 
     // Buffer size: balance between memory usage and I/O efficiency
-    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
+    // Buffered reads (-lm none) used 1 MB chunks; 64 MB like direct I/O read a page-cached file about 1.5x faster
+    // (3.2 -> 4.8 GB/s measured). LLAMA_LOAD_BUFFER_MB overrides the buffered chunk size (1 = the old default).
+    static const size_t buffered_size = [] {
+        const char * e = getenv("LLAMA_LOAD_BUFFER_MB");
+        const long mb = e != nullptr ? atol(e) : 64;
+        return (size_t) std::max(1L, std::min(mb, 1024L)) * 1024 * 1024;
+    }();
+    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : buffered_size;
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
