@@ -13516,6 +13516,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // GQA ratios that are not a power of 2 (padded Q head groups)
+    for (int hs : { 128, 256, }) {
+        for (int nh : { 1, 2, 4, }) {
+            for (int nr2 : { 3, 5, 6, 7, }) {
+                for (int nb : { 1, 2, 3, 4, 8, 9, }) {
+                    for (bool sinks : { false, true, }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {nr2, 1}, 512, nb, true, sinks, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+                    }
+                }
+            }
+        }
+    }
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
