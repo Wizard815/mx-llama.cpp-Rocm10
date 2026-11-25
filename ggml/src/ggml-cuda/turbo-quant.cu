@@ -353,6 +353,54 @@ void dequantize_row_turbo2_0_bf16_nc_cuda(
         vx, y, ne00, ne01, ne02, ne03, s01, s02, s03);
 }
 
+// Non-contiguous dequant for turbo4 (the FlashAttention f16 fallback converts strided K/V views)
+template<typename dst_t>
+static __global__ void dequantize_block_turbo4_0_nc_kernel(
+    const void * __restrict__ vx,
+    dst_t      * __restrict__ y,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+    const int64_t s01,  const int64_t s02,  const int64_t s03
+) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ne00 * ne01 * ne02 * ne03) return;
+
+    const int64_t i03 = i / (ne00 * ne01 * ne02);
+    const int64_t i02 = (i / (ne00 * ne01)) % ne02;
+    const int64_t i01 = (i / ne00) % ne01;
+    const int64_t i00 = i % ne00;
+
+    const char * src = (const char *)vx + i01*s01 + i02*s02 + i03*s03;
+    const int64_t blk_idx = i00 / QK_TURBO4;
+    const int     elem    = (int)(i00 % QK_TURBO4);
+    const block_turbo4_0 * x = (const block_turbo4_0 *)src + blk_idx;
+
+    const float norm = __half2float(x->norm);
+    const float rnorm = __half2float(x->rnorm);
+    const float qjl_scale = 1.2533141f / 128.0f * rnorm;
+
+    uint8_t idx = turbo4_unpack_3bit(x->qs, elem);
+    float sgn = (x->signs[elem / 8] & (1 << (elem % 8))) ? 1.0f : -1.0f;
+
+    y[i] = (dst_t)((TURBO3_CENTROIDS_C[idx] + sgn * qjl_scale) * norm);
+}
+
+#define TURBO4_NC_WRAPPER(NAME, T) \
+void NAME( \
+    const void * vx, T * y, \
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03, \
+    int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream \
+) { \
+    const int64_t total = ne00 * ne01 * ne02 * ne03; \
+    const int threads = 256; \
+    const int blocks  = (total + threads - 1) / threads; \
+    dequantize_block_turbo4_0_nc_kernel<T><<<blocks, threads, 0, stream>>>( \
+        vx, y, ne00, ne01, ne02, ne03, s01, s02, s03); \
+}
+TURBO4_NC_WRAPPER(dequantize_row_turbo4_0_fp16_nc_cuda, half)
+TURBO4_NC_WRAPPER(dequantize_row_turbo4_0_fp32_nc_cuda, float)
+TURBO4_NC_WRAPPER(dequantize_row_turbo4_0_bf16_nc_cuda, nv_bfloat16)
+#undef TURBO4_NC_WRAPPER
+
 // ═══════════════════════════════════════════════════════════════════════
 //  GGML_OP_TURBO_WHT — Fast Walsh-Hadamard Transform with sign rotation
 //

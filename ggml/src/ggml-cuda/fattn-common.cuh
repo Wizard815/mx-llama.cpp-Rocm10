@@ -1559,7 +1559,7 @@ void launch_fattn(
         GGML_ASSERT(f16_extra.K != 0);
         half * K_f16 = (half *) f16_extra.K;
         if (ggml_is_contiguously_allocated(K)) {
-            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type); GGML_ASSERT(to_fp16 != nullptr && "no f16 converter for this KV cache type");
             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
 
             nb11 = nb11*bs*sizeof(half)/ts;
@@ -1567,7 +1567,7 @@ void launch_fattn(
             nb13 = nb13*bs*sizeof(half)/ts;
         } else {
             GGML_ASSERT(K->nb[0] == ts);
-            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type); GGML_ASSERT(to_fp16 != nullptr && "no f16 converter for this KV cache type");
             const int64_t s01 = nb11 / ts;
             const int64_t s02 = nb12 / ts;
             const int64_t s03 = nb13 / ts;
@@ -1593,7 +1593,7 @@ void launch_fattn(
             GGML_ASSERT(f16_extra.V != 0);
             half * V_f16 = (half *) f16_extra.V;
             if (ggml_is_contiguously_allocated(V)) {
-                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type); GGML_ASSERT(to_fp16 != nullptr && "no f16 converter for this KV cache type");
                 to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
                 V_data = (char *) V_f16;
 
@@ -1602,7 +1602,7 @@ void launch_fattn(
                 nb23 = nb23*bs*sizeof(half)/ts;
             } else {
                 GGML_ASSERT(V->nb[0] == ts);
-                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type); GGML_ASSERT(to_fp16 != nullptr && "no f16 converter for this KV cache type");
                 const int64_t s01 = nb21 / ts;
                 const int64_t s02 = nb22 / ts;
                 const int64_t s03 = nb23 / ts;
