@@ -329,7 +329,13 @@ void llama_model_saver::add_kv_from_model() {
             }
         }
     }
-    add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,        hparams.is_recr_impl, true);
+    if (hparams.n_layer_nextn > 0) {
+        // the loaders read the recurrent layer map over n_layer_all, which includes the MTP (nextn) blocks
+        const std::vector<uint32_t> recr(hparams.is_recr_impl.begin(), hparams.is_recr_impl.begin() + hparams.n_layer_all);
+        add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,    recr, false);
+    } else {
+        add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,    hparams.is_recr_impl, true);
+    }
     if (hparams.n_relative > 0) {
         add_kv(LLM_KV_ATTENTION_RELATIVE_LENGTH,     hparams.n_relative);
         add_kv(LLM_KV_ATTENTION_RELATIVE_EXTENT,     hparams.n_relative_extent);

@@ -353,7 +353,17 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_CONTEXT_LENGTH,            n_ctx);
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
-    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+    // LLAMA_TEST_ARCHS_NEXTN=1: give qwen35/qwen35moe one MTP (nextn) block after the trunk, so the
+    // saved models (-o) can run --spec-type draft-mtp, e.g. under -sm tensor over RPC devices
+    static const bool add_nextn = [] {
+        const char * e = getenv("LLAMA_TEST_ARCHS_NEXTN");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    const bool with_nextn = add_nextn && (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
+    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer + (with_nextn ? 1 : 0));
+    if (with_nextn) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS,  uint32_t(1));
+    }
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
 
     if (arch == LLM_ARCH_K2_HORIZON) {
@@ -862,6 +872,10 @@ static llama_model_ptr get_model(
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
+    // the MTP blocks of LLAMA_TEST_ARCHS_NEXTN models are created (and saved) only when loaded
+    if (const char * e = getenv("LLAMA_TEST_ARCHS_NEXTN"); e != nullptr && atoi(e) != 0) {
+        model_params.load_mtp = true;
+    }
 
     tensor_data_params tensor_params = { seed, stdev };
     llama_model_ptr model(gguf_ctx != nullptr ?
