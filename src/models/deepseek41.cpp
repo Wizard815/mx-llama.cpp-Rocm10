@@ -97,6 +97,7 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
 
 void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
+    GGML_UNUSED(ml);
 
     const int64_t q_lora_rank     = hparams.n_lora_q;
     const int64_t n_ff_exp        = hparams.n_ff_exp();
