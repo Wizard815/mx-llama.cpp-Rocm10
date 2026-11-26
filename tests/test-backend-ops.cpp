@@ -13017,6 +13017,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, false, 64, 33792, 64));
     // kernel_mul_mm_id: > 2^31-element dst (8.7 GB), about 45 GB peak memory. Tokens 32514+ have a dst offset past INT32_MAX, tokens 32768+ also need a 32-bit token index.
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 16, 8, false, 8256, 32832, 64));
+    // CUDA mul_mat_f_ids: 160 F16 experts of 4096 x 7168 (9.4 GB), about 36 GB peak memory. Experts 147-159 start past INT32_MAX half2 values, 32 tokens x 8 random experts.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 160, 8, true, 4096, 32, 7168));
 #endif
 
 #if 0
@@ -13869,6 +13871,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_concat(GGML_TYPE_Q8_0, {8192, 2, 1, 1}, dim == 0 ? 4096 : 1, dim, 0));
     }
 
+    // non-contiguous with ne[2] or ne[3] > 65535 (CUDA grid y/z limit)
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {4, 2, 70000, 1}, 4, 0, 1));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {4, 2, 40000, 1}, 30000, 2, 1));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {4, 2, 1, 70000}, 4, 0, 1));
+
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_concat(type, {64, 4, 512, 1}, 512, 2, 0));
         test_cases.emplace_back(new test_concat(type, {66, 4, 512, 1}, 512, 2, 0));
@@ -14263,7 +14270,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                 if (nh == 1 && hsk != 320 && hsk != 576) continue;
                                 for (int nr3 : { 1, 3, }) {
                                     if (hsk > 64 && nr3 > 1) continue; // skip broadcast for large head sizes
-                                    for (int nr2 : { 1, 4, 8, 12, 16, 20, 32 }) {
+                                    for (int nr2 : { 1, 2, 3, 4, 8, 12, 16, 20, 32 }) {
+                                        if ((nr2 == 2 || nr2 == 3) && hsk != 576) continue; // MLA with a GQA ratio below 4
                                         if (nr2 ==  8 && hsk != 192) continue;
                                         if (nr2 == 12 && hsk != 128) continue;
                                         if (nr2 == 16 && hsk != 192) continue;

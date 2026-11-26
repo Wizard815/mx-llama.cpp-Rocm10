@@ -688,6 +688,8 @@ struct common_sampler * common_sampler_init(
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
         /* .top_k_first = */ top_k_first,
         /* .sparse  = */ std::move(sparse),
+        /* .sparse_ids  = */ {},
+        /* .sparse_cand = */ {},
     };
 
     return result;
@@ -774,6 +776,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .rng     = */ gsmpl->rng,
         /* .top_k_first = */ gsmpl->top_k_first,
         /* .sparse  = */ gsmpl->sparse,
+        /* .sparse_ids  = */ {},
+        /* .sparse_cand = */ {},
     };
 }
 

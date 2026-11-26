@@ -2597,7 +2597,9 @@ static bool should_strip_proxy_header(const std::string & header_name) {
     if (header_name == "server" ||
         header_name == "transfer-encoding" ||
         header_name == "content-length" || // quick fix for https://github.com/ggml-org/llama.cpp/issues/17710
-        header_name == "keep-alive") {
+        header_name == "keep-alive" ||
+        // hop-by-hop: the child's "close" is about the router's own connection to it, not the client's
+        header_name == "connection") {
         return true;
     }
 
@@ -2791,6 +2793,10 @@ server_http_proxy::server_http_proxy(
             const auto lowered = to_lower_copy(key);
             if (lowered == "accept-encoding") {
                 // disable Accept-Encoding to avoid compressed responses
+                continue;
+            }
+            if (lowered == "connection" || lowered == "keep-alive") {
+                // hop-by-hop: the client's connection ends at the router
                 continue;
             }
             if (lowered == "transfer-encoding") {
