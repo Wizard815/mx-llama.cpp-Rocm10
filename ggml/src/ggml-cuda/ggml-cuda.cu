@@ -3124,6 +3124,13 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    // The fused mat-vec epilogues (mmvf, mmvq, the gfx906 row groups, the repacked MMV) apply SWIGLU_OAI with the
+    // default alpha and limit of ggml_cuda_op_swiglu_oai_single, so a GLU node with other values runs unfused.
+    if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_OAI &&
+            (ggml_get_op_params_f32(glu, 2) != 1.702f || ggml_get_op_params_f32(glu, 3) != 7.0f)) {
+        return false;
+    }
+
     return true;
 }
 
