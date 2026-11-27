@@ -51,14 +51,15 @@ CMAKE_ARGS=${CMAKE_ARGS:-$DEFAULT_CMAKE_ARGS}
 # name|env. "before" first: the perf table compares every other column with it.
 CONFIGS=(
     "before|GGML_FA_TILE_GFX906=0 GGML_FA_KV_PREFETCH=0"
-    "rows|GGML_FA_KV_PREFETCH=0"
-    "prefetch|GGML_FA_TILE_GFX906=0"
-    "rows+prefetch|"
+    "default|"
+    "rows|GGML_FA_TILE_GFX906=1 GGML_FA_KV_PREFETCH=0"
+    "prefetch|GGML_FA_TILE_GFX906=0 GGML_FA_KV_PREFETCH=62"
+    "rows+prefetch|GGML_FA_TILE_GFX906=1 GGML_FA_KV_PREFETCH=62"
     "nopad:before|GGML_CUDA_FA_GQA_PAD=0 GGML_FA_TILE_GFX906=0 GGML_FA_KV_PREFETCH=0"
-    "nopad:rows+prefetch|GGML_CUDA_FA_GQA_PAD=0"
+    "nopad:rows+prefetch|GGML_CUDA_FA_GQA_PAD=0 GGML_FA_TILE_GFX906=1 GGML_FA_KV_PREFETCH=62"
 )
 # llama-bench runs fewer configs, each one loads the model again
-BENCH_CONFIGS=("before" "rows+prefetch" "nopad:rows+prefetch")
+BENCH_CONFIGS=("before" "default" "rows+prefetch")
 
 TEST_FILTER=${TEST_FILTER:-'hsk=256,hsv=256'}
 if [ -n "${PERF_FILTER:-}" ]; then
@@ -141,7 +142,8 @@ if '-o' in args:
     i = args.index('-o'); args[i + 1] = '/dev/null'
 args = [a for a in args if not a.startswith(('-MD', '-MF', '-MT')) or a == '-MD']
 args = [a for a in args if a != '-MD']
-args += ['-Rpass-analysis=kernel-resource-usage', '-Wno-everything']
+# ROCm clang only prints the resource remarks for the device compile
+args += ['--offload-device-only', '-Rpass-analysis=kernel-resource-usage', '-Wno-everything']
 r = subprocess.run(args, cwd=e['directory'], capture_output=True, text=True)
 rows, cur = [], None
 for l in r.stderr.splitlines():

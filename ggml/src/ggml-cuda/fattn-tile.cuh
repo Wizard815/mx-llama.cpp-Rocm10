@@ -234,7 +234,8 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     return 0;
 }
 
-// Measured on the MI50 for 1 to 8 tokens with 2 heads per block; used unless GGML_FA_TILE_GFX906=0.
+// rayakame's MI50 rows for 1 to 8 tokens with 2 heads per block; opt-in with GGML_FA_TILE_GFX906=1 (slower than the GCN table
+// for GQA 2 from 1024 K/V rows on in this fork's MI50 A/B, 2026-11-27).
 static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_gfx906(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2, 128, 3,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 3,  64,  32)
@@ -1364,12 +1365,13 @@ static void launch_fattn_tile_cols(ggml_backend_cuda_context & ctx, ggml_tensor 
         constexpr bool has_prefetch = DKQ == 256 && DV == 256;
         static const bool gfx906_env = [] {
             const char * env = getenv("GGML_FA_TILE_GFX906");
-            return env == nullptr || atoi(env) != 0;
+            return env != nullptr && atoi(env) != 0;
         }();
-        // Bit mask of the column counts that prefetch K/V; 0 turns it off.
+        // Bit mask of the column counts that prefetch K/V; 0 turns it off. Default 32 columns (9+ tokens), the only width
+        // measured faster on MI50 (16 tokens GQA 6, -11% FA time); 2..16 columns lost or broke even there.
         static const int kv_prefetch_cols = [] {
             const char * env = getenv("GGML_FA_KV_PREFETCH");
-            return env == nullptr ? 2 | 4 | 8 | 16 | 32 : atoi(env);
+            return env == nullptr ? 32 : atoi(env);
         }();
         const bool gcn = GGML_CUDA_CC_IS_GCN(cc);
         // Below 1024 K/V rows the grid of 128-thread blocks is too small to fill the CUs for 2 or more tokens.
