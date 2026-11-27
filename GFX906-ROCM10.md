@@ -68,6 +68,12 @@ plus these later ggml-org/llama.cpp commits cherry-picked for HIP/GCN:
 - Exact top-k fast path in `common_sampler` (also with penalties, DRY and a logit bias), and
   MTP drafts of several requests padded to one length so they verify in one pass (rayakame).
 - `-mllvm -amdgpu-sched-strategy=max-ilp` compiler flag recommended at build time (see below)
+- From kinchahoy/llama-of-vega.cpp: graph startup churn no longer counts toward the
+  "unstable graph" cutoff, so a run that changes shape while warming up keeps its HIP
+  graphs (6943a105); cheaper IQ2_S/IQ3_XXS sign handling on gfx906 in mat-vec and MMQ
+  (210b13ec, same results bit for bit).
+- From thejacer/slop.cpp: an opt-in pinned upload ring for the small per-token graph
+  inputs (`GGML_CUDA_UPLOAD_RING=1`, see below).
 
 ## Now upstream (dropped from this fork)
 
@@ -121,6 +127,7 @@ no rebuild. Defaults are what a plain launch gets.
 | `LLAMA_DIO_AUTO_FILL=0/1` | auto | `-lm dio-auto` cache misses: 1 = read buffered so the next load is from RAM, 0 = read with O_DIRECT (no cache fill). Auto fills when the file fits in MemAvailable with 1/8 spare |
 | `GGML_FA_TILE_GFX906=0` | on | tile FA head 256, 2 Q heads per block: rayakame's MI50 rows for 1..8 tokens (128 threads, nbatch_K 32); used for 1 token always and for 2..8 tokens from 1024 K/V rows on. Off = the GCN table. 2 heads per block means GQA 2 (or 10, 14, ...); GQA 6 gets there only with `GGML_CUDA_FA_GQA_PAD=0`, since by default 1..8 tokens of GQA 3 and 5..7 are padded to 4/8 heads per block. Quantized K/V at 1..2 tokens use the vec kernel instead |
 | `GGML_FA_KV_PREFETCH=0` or a mask | all (2,4,8,16,32) | tile FA head 256, 2 Q heads per block (same GQA limits as above; GQA 6 from 9 tokens on uses it with the 32-column GCN row): load the next K/V chunk into registers while the current one is computed. Same math; results can differ in the last bits where a variant's occupancy changes the number of parallel blocks. The value is a bit mask of the column counts that prefetch; 1 token from 32K K/V rows on never prefetches |
+| `GGML_CUDA_UPLOAD_RING=1` | off | small `set_tensor` uploads (up to 1 MiB, the graph inputs of every token) go through an 8 MiB pinned ring on a per-device upload stream, with no host sync per upload; every later reader of that device's memory waits on the upload event. Not with `GGML_CUDA_NO_PINNED=1` |
 | `GGML_HIP_GRAPH_REINSTANTIATE=1` | off | re-instantiate HIP graphs instead of `hipGraphExecUpdate`, which leaks ~1 MiB per request on ROCm (issue 10713) |
 
 Build-time A/B options (not on by default until measured on MI50; Docker: `GFX906_HIP_FLAGS` / `GFX906_HIP_MAX_ILP` in `.env`):

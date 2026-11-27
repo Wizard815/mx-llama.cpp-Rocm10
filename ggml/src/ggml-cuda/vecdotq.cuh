@@ -1195,6 +1195,19 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
     return d * sumi;
 }
 
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+// 0xFF in byte i for each set bit i of the low 4 sign bits
+static __device__ __forceinline__ uint32_t sign_mask4(const uint32_t signs) {
+    const uint32_t bits = __umul24(signs & 0x0f, 0x00204081) & 0x01010101;
+    return (bits << 8) - bits;
+}
+
+// negate the bytes selected by m; IQ grid bytes are 0x01..0x3e, so the +1 never carries into the next byte
+static __device__ __forceinline__ int iq_apply_signs(const int grid, const uint32_t m) {
+    return (grid ^ m) + (m & 0x01010101);
+}
+#endif
+
 #define VDR_IQ2_S_Q8_1_MMVQ 2
 #define VDR_IQ2_S_Q8_1_MMQ  2
 
@@ -1220,11 +1233,16 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
 
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+        const int grid_l = iq_apply_signs(grid_pos[0], sign_mask4(signs_packed_8[l0/2]));
+        const int grid_h = iq_apply_signs(grid_pos[1], sign_mask4(signs_packed_8[l0/2] >> 4));
+#else
         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
 
         const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+#endif
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
@@ -1261,6 +1279,17 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
         const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
         const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
 
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+        const uint32_t signs0 = sign_mask4(signs);
+        const uint32_t signs1 = sign_mask4(signs >> 4);
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid_pos.x ^ signs0, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid_pos.y ^ signs1, u1, sumi);
+        sumi -= ggml_cuda_dp4a(signs0, u0, ggml_cuda_dp4a(signs1, u1, 0));
+#else
+
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
 
@@ -1273,6 +1302,7 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
 
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+#endif
     }
 
     const int ls = aux32 >> 28;
